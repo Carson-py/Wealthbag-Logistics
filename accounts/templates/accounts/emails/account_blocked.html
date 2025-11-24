@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Account Blocked</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #f4f6f8;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #1f2937;
+        }
+        .wrapper {
+            max-width: 640px;
+            margin: 0 auto;
+            padding: 32px 16px;
+        }
+        .card {
+            background: #ffffff;
+            border-radius: 16px;
+            box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #7f1d1d, #dc2626);
+            padding: 28px 24px;
+            text-align: center;
+        }
+        .header img {
+            height: 56px;
+            margin-bottom: 12px;
+        }
+        .header h1 {
+            color: #ffffff;
+            margin: 0;
+            font-size: 26px;
+        }
+        .content {
+            padding: 32px;
+        }
+        .content h2 {
+            margin-top: 0;
+            color: #0f172a;
+            font-size: 22px;
+        }
+        .content p {
+            line-height: 1.6;
+            margin: 16px 0;
+        }
+        .notice {
+            border-left: 4px solid #dc2626;
+            background: #fef2f2;
+            padding: 16px 20px;
+            border-radius: 12px;
+            margin: 24px 0;
+        }
+        .footer {
+            text-align: center;
+            padding: 0 24px 32px;
+            color: #6b7280;
+            font-size: 13px;
+        }
+        @media (max-width: 600px) {
+            .content { padding: 24px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <div class="card">
+            <div class="header">
+                <img src="{{ company_logo_url }}" alt="{{ company_name }} Logo" />
+                <h1>Account Access Restricted</h1>
+            </div>
+            <div class="content">
+                <h2>Hi {{ full_name }},</h2>
+                <p>
+                    This is to let you know that your <strong>{{ company_name }}</strong> account has been
+                    <strong>temporarily blocked</strong>. For your security, you will not be able to sign in until
+                    the restriction is lifted.
+                </p>
+                <div class="notice">
+                    <p style="margin: 0;">
+                        If you believe this action was made in error or you need urgent access, please contact our
+                        support team as soon as possible.
+                    </p>
+                </div>
+                <p>
+                    Reach us at <a href="mailto:{{ support_email }}">{{ support_email }}</a> with any additional
+                    details so we can review and resolve the issue promptly.
+                </p>
+                <p>Thank you for your understanding.<br />— The {{ company_name }} Security Team</p>
+            </div>
+        </div>
+        <div class="footer">
+            {{ company_name }} • Automated notification, please do not reply.
+        </div>
+    </div>
+</body>
+</html>
+

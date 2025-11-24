@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Account Restored</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #f4f6f8;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #1f2937;
+        }
+
+        .wrapper {
+            max-width: 640px;
+            margin: 0 auto;
+            padding: 32px 16px;
+        }
+
+        .card {
+            background: #ffffff;
+            border-radius: 16px;
+            box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #0f766e, #14b8a6);
+            padding: 28px 24px;
+            text-align: center;
+        }
+
+        .header img {
+            height: 56px;
+            margin-bottom: 12px;
+        }
+
+        .header h1 {
+            color: #ffffff;
+            margin: 0;
+            font-size: 26px;
+        }
+
+        .content {
+            padding: 32px;
+        }
+
+        .content h2 {
+            margin-top: 0;
+            color: #0f172a;
+            font-size: 22px;
+        }
+
+        .content p {
+            line-height: 1.6;
+            margin: 16px 0;
+        }
+
+        .notice {
+            border-left: 4px solid #0d9488;
+            background: #ecfdf5;
+            padding: 16px 20px;
+            border-radius: 12px;
+            margin: 24px 0;
+        }
+
+        .cta {
+            text-align: center;
+            margin: 30px 0 10px;
+        }
+
+        .cta a {
+            display: inline-block;
+            padding: 14px 34px;
+            background: #0f172a;
+            color: #ffffff;
+            text-decoration: none;
+            border-radius: 999px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+        }
+
+        .footer {
+            text-align: center;
+            padding: 0 24px 32px;
+            color: #6b7280;
+            font-size: 13px;
+        }
+
+        @media (max-width: 600px) {
+            .content {
+                padding: 24px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="wrapper">
+        <div class="card">
+            <div class="header">
+                <img src="{{ company_logo_url }}" alt="{{ company_name }} Logo" />
+                <h1>Access Restored</h1>
+            </div>
+            <div class="content">
+                <h2>Welcome back, {{ full_name }}!</h2>
+                <p>
+                    We are glad to let you know that your <strong>{{ company_name }}</strong> account has been
+                    <strong>reactivated</strong>. You may now log in and continue using the platform as usual.
+                </p>
+                <div class="notice">
+                    <p style="margin: 0;">
+                        For your security, please review your recent activity after logging in. If anything appears
+                        unusual, contact us immediately.
+                    </p>
+                </div>
+                
+                <p>
+                    If you have any questions, reach us at
+                    <a href="mailto:{{ support_email }}">{{ support_email }}</a>.
+                </p>
+                <p>The {{ company_name }} Team</p>
+            </div>
+        </div>
+        <div class="footer">
+            {{ company_name }} • Automated notification, please do not reply.
+        </div>
+    </div>
+</body>
+
+</html>
