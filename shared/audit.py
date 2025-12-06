@@ -55,6 +55,7 @@ from django.contrib.auth import get_user_model
 from django.db import models
 from django.http import HttpRequest
 from functools import wraps
+from django.core.exceptions import PermissionDenied
 
 User = get_user_model()
 
@@ -191,6 +192,19 @@ def log_activity(
         logger = logging.getLogger(__name__)
         logger.error(f"Failed to create audit log: {e}")
         return None
+
+
+def get_audit_logs(user: Optional[User], **filters):
+    """
+    Retrieve audit logs with optional filters. Only admins may view logs.
+    """
+    if user is None or getattr(user, 'role', None) not in ['admin', 'auditor']:
+        raise PermissionDenied('You are not authorized to view audit logs.')
+
+    queryset = AuditLog.objects.all()
+    if filters:
+        queryset = queryset.filter(**filters)
+    return queryset.order_by('-timestamp')
 
 
 def get_client_ip(request: HttpRequest) -> str:

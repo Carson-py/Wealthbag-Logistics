@@ -15,4 +15,5 @@ urlpatterns = [
     
     # Barcode lookup (for React app scanning)
     path('lookup/', views.BarcodeLookupView.as_view(), name='barcode-lookup'),
+    path('barcodes/', views.BarcodeListView.as_view(), name='barcodes')
 ]

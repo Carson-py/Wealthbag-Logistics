@@ -21,7 +21,7 @@ class Warehouse(models.Model):
     def clean(self):
         """Ensure only one warehouse is marked as main"""
         if self.is_main:
-            # Check if another warehouse is already marked as main
+            # Check if another warehouse is already marked as mainx,[]
             other_main = Warehouse.objects.filter(is_main=True).exclude(pk=self.pk).first()
             if other_main:
                 raise ValidationError(
@@ -36,8 +36,10 @@ class Warehouse(models.Model):
 
 class Branch(models.Model):
     name = models.CharField(max_length=255)
-    warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE, related_name='branches',
-                                  verbose_name='Warehouse', help_text='Warehouse this branch belongs to')
+    warehouse = models.ForeignKey(Warehouse, on_delete=models.SET_NULL, null=True, blank=True,
+                                  related_name='branches',
+                                  verbose_name='Warehouse', 
+                                  help_text='Warehouse this branch belongs to (optional)')
     address = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

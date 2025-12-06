@@ -10,7 +10,7 @@ from decimal import Decimal
 
 from .serializers import (
     ProductSerializer, CategorySerializer, UnitSerializer, CreateProductSerializer,
-    BulkCreateProductSerializer
+    BulkCreateProductSerializer, BarcodeSerializer
 )
 from .models import Barcode
 from django.db import models
@@ -324,3 +324,54 @@ class BarcodeLookupView(APIView):
             response_data['purchase_price'] = str(product_info['purchase_price'])
         
         return Response(response_data, status=status.HTTP_200_OK)
+
+
+class BarcodeListView(APIView):
+    """
+    List all barcodes with their product details for display/printing.
+    """
+    permission_classes = [IsAuthenticated]
+    
+    @swagger_auto_schema(
+        manual_parameters=[
+            openapi.Parameter(
+                'product_id',
+                openapi.IN_QUERY,
+                description='Filter by product ID',
+                type=openapi.TYPE_INTEGER,
+                required=False,
+            ),
+            openapi.Parameter(
+                'is_primary',
+                openapi.IN_QUERY,
+                description='Filter by primary barcodes only (true/false)',
+                type=openapi.TYPE_BOOLEAN,
+                required=False,
+            ),
+        ],
+        responses={200: BarcodeSerializer(many=True)}
+    )
+    def get(self, request):
+        """
+        Return all barcodes with associated product details.
+        This is ideal for frontend barcode lists and printing labels.
+        """
+        barcodes = Barcode.objects.select_related('product').all()
+        
+        product_id = request.query_params.get('product_id')
+        is_primary = request.query_params.get('is_primary')
+        
+        if product_id:
+            barcodes = barcodes.filter(product_id=product_id)
+        
+        if is_primary is not None:
+            # Accept 'true'/'false' strings from query params
+            val = str(is_primary).lower()
+            if val in ['true', '1', 'yes']:
+                barcodes = barcodes.filter(is_primary=True)
+            elif val in ['false', '0', 'no']:
+                barcodes = barcodes.filter(is_primary=False)
+        
+        barcodes = barcodes.order_by('-is_primary', 'product__name', 'barcode')
+        serializer = BarcodeSerializer(barcodes, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)

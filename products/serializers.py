@@ -2,7 +2,7 @@ from rest_framework import serializers
 from decimal import Decimal
 from django.db.models import Sum
 from .models import (
-    Product, Unit, Category
+    Product, Unit, Category, Barcode
 )
 from organization.serializers import BranchSerializer, WarehouseSerializer
 from stock.services import get_average_purchase_price
@@ -63,4 +63,28 @@ class BulkCreateProductSerializer(serializers.Serializer):
         if not value or len(value) == 0:
             raise serializers.ValidationError('At least one product must be provided.')
         return value
+
+
+class BarcodeSerializer(serializers.ModelSerializer):
+    """Barcode with basic product details for listing/printing on frontend."""
+    product_sku = serializers.CharField(source='product.sku', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_id = serializers.IntegerField(source='product.id', read_only=True)
+    
+    class Meta:
+        model = Barcode
+        fields = [
+            'id',
+            'barcode',
+            'barcode_image',
+            'is_primary',
+            'notes',
+            'created_at',
+            'updated_at',
+            'product',
+            'product_id',
+            'product_sku',
+            'product_name',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
 

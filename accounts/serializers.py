@@ -37,14 +37,24 @@ class UserSerializer(serializers.ModelSerializer):
     warehouse = serializers.SerializerMethodField()
     branch_name = serializers.SerializerMethodField()
     warehouse_name = serializers.SerializerMethodField()
-
+    employee_name = serializers.SerializerMethodField()
     class Meta:
         model = User
         fields = [
             'id', 'email', 'role', 'role_display', 'is_active', 'date_joined', 
-            'first_login', 'branch', 'warehouse', 'branch_name', 'warehouse_name'
+            'first_login', 'branch', 'warehouse', 'branch_name', 'warehouse_name', 'employee_name'
         ]
         read_only_fields = ['date_joined']
+
+    def get_employee_name(self, obj):
+        """Get employee name from employee profile"""
+        try:
+            employee = obj.profile.first()
+            if employee and employee.first_name and employee.last_name:
+                return f'{employee.first_name} {employee.last_name}'
+        except:
+            pass
+        return None
 
     def get_branch(self, obj):
         """Get branch ID from employee profile"""
@@ -153,17 +163,4 @@ class ChangePasswordSerializer(serializers.Serializer):
 
 
 class ResetPasswordSerializer(serializers.Serializer):
-    email = serializers.EmailField(required=False)
-    user_id = serializers.IntegerField(required=False)
-
-    def validate(self, data):
-        email = data.get('email')
-        user_id = data.get('user_id')
-        
-        if not email and not user_id:
-            raise serializers.ValidationError('Either email or user_id must be provided.')
-        
-        if email and user_id:
-            raise serializers.ValidationError('Provide either email or user_id, not both.')
-        
-        return data
+    email = serializers.EmailField(required=True)

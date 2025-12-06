@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
+from django.core.exceptions import ValidationError
 from .serializers import BranchSerializer, WarehouseSerializer
 from . import services
 from .models import Branch, Warehouse
@@ -31,14 +32,14 @@ class ListCreateBranchView(APIView):
         if serializer.is_valid():
             try:
                 warehouse = serializer.validated_data.get('warehouse')
-                if not warehouse:
-                    return Response({'detail': 'warehouse is required.'}, status=status.HTTP_400_BAD_REQUEST)
+                warehouse_id = None
+                if warehouse:
+                    warehouse_id = warehouse.id if hasattr(warehouse, 'id') else warehouse
                 
-                warehouse_id = warehouse.id if hasattr(warehouse, 'id') else warehouse
                 branch = services.create_branch(
-                    warehouse_id=warehouse_id,
                     name=serializer.validated_data['name'],
-                    address=serializer.validated_data.get('address', '')
+                    address=serializer.validated_data.get('address', ''),
+                    warehouse_id=warehouse_id
                 )
                 return Response(BranchSerializer(branch).data, status=status.HTTP_201_CREATED)
             except Warehouse.DoesNotExist:
@@ -72,16 +73,24 @@ class BranchDetailView(APIView):
         try:
             serializer = BranchSerializer(data=request.data)
             if serializer.is_valid():
-                warehouse_id = None
-                if 'warehouse' in serializer.validated_data:
-                    warehouse_id = serializer.validated_data['warehouse'].id if hasattr(serializer.validated_data['warehouse'], 'id') else serializer.validated_data['warehouse']
+                branch = Branch.objects.get(pk=pk)
                 
-                branch = services.edit_branch(
-                    pk=pk,
-                    name=serializer.validated_data.get('name'),
-                    address=serializer.validated_data.get('address'),
-                    warehouse_id=warehouse_id
-                )
+                # Handle warehouse update
+                if 'warehouse' in serializer.validated_data:
+                    warehouse = serializer.validated_data['warehouse']
+                    if warehouse is None:
+                        branch.warehouse = None
+                    else:
+                        warehouse_id = warehouse.id if hasattr(warehouse, 'id') else warehouse
+                        branch.warehouse = Warehouse.objects.get(pk=warehouse_id)
+                
+                # Update other fields
+                if 'name' in serializer.validated_data:
+                    branch.name = serializer.validated_data['name']
+                if 'address' in serializer.validated_data:
+                    branch.address = serializer.validated_data['address']
+                
+                branch.save()
                 return Response(BranchSerializer(branch).data)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         except Branch.DoesNotExist:
@@ -98,16 +107,24 @@ class BranchDetailView(APIView):
         try:
             serializer = BranchSerializer(data=request.data, partial=True)
             if serializer.is_valid():
-                warehouse_id = None
-                if 'warehouse' in serializer.validated_data:
-                    warehouse_id = serializer.validated_data['warehouse'].id if hasattr(serializer.validated_data['warehouse'], 'id') else serializer.validated_data['warehouse']
+                branch = Branch.objects.get(pk=pk)
                 
-                branch = services.edit_branch(
-                    pk=pk,
-                    name=serializer.validated_data.get('name'),
-                    address=serializer.validated_data.get('address'),
-                    warehouse_id=warehouse_id
-                )
+                # Handle warehouse update
+                if 'warehouse' in serializer.validated_data:
+                    warehouse = serializer.validated_data['warehouse']
+                    if warehouse is None:
+                        branch.warehouse = None
+                    else:
+                        warehouse_id = warehouse.id if hasattr(warehouse, 'id') else warehouse
+                        branch.warehouse = Warehouse.objects.get(pk=warehouse_id)
+                
+                # Update other fields
+                if 'name' in serializer.validated_data:
+                    branch.name = serializer.validated_data['name']
+                if 'address' in serializer.validated_data:
+                    branch.address = serializer.validated_data['address']
+                
+                branch.save()
                 return Response(BranchSerializer(branch).data)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         except Branch.DoesNotExist:
@@ -154,6 +171,13 @@ class ListCreateWarehouseView(APIView):
                     is_main=serializer.validated_data.get('is_main', False)
                 )
                 return Response(WarehouseSerializer(warehouse).data, status=status.HTTP_201_CREATED)
+            except ValidationError as e:
+                # Extract message from ValidationError
+                if hasattr(e, 'messages') and e.messages:
+                    error_message = e.messages[0] if isinstance(e.messages, list) else str(e.messages)
+                else:
+                    error_message = str(e)
+                return Response({'detail': error_message}, status=status.HTTP_400_BAD_REQUEST)
             except Exception as e:
                 return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
             
@@ -169,7 +193,7 @@ class WarehouseDetailView(APIView):
     def get(self, request, pk):
         """Retrieve a specific warehouse."""
         try:
-            warehouse = Warehouse.objects.select_related('branch').get(pk=pk)
+            warehouse = Warehouse.objects.select_related().get(pk=pk)
             serializer = WarehouseSerializer(warehouse)
             return Response(serializer.data)
         except Warehouse.DoesNotExist:

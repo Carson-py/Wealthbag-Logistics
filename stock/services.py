@@ -1,13 +1,23 @@
-from django.db.models import Sum, F, Q
+from django.db.models import Sum, F, Q, Min
 from django.db import transaction
 from django.utils import timezone
+from django.conf import settings
 from decimal import Decimal
 from datetime import datetime
 from typing import List, Dict, Tuple, Any, Optional
 import uuid
+import io
+import base64
+from mailjet_rest import Client
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from .models import StockEntry, StockAdjustment, BranchStock, StockTransfer, StockTransferItem, StockEntryGroup
 from products.models import Product
 from organization.models import Warehouse, Branch
+from accounts.models import User, Employee
 
 
 def _make_serializable(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -280,6 +290,62 @@ def add_multi_product_stock_to_warehouse(
     
     return entry_group
 
+def get_low_stock_products():
+    """
+    Return list of products whose total quantity in a warehouse is at or below their reorder level.
+    """
+    low_stock_entries = (
+        StockEntry.objects
+        .values('product_id', 'product__name', 'product__sku', 'warehouse_id', 'warehouse__name')
+        .annotate(
+            total_quantity=Sum('quantity'),
+            reorder_level=Min('reorder_level')
+        )
+        .filter(reorder_level__isnull=False)
+        .filter(total_quantity__lte=F('reorder_level'))
+    )
+
+    results = []
+    for entry in low_stock_entries:
+        results.append({
+            'product_id': entry['product_id'],
+            'product_name': entry['product__name'],
+            'product_sku': entry['product__sku'],
+            'warehouse_id': entry['warehouse_id'],
+            'warehouse_name': entry['warehouse__name'],
+            'quantity': entry['total_quantity'],
+            'reorder_level': entry['reorder_level'],
+        })
+    return results
+
+
+def get_low_branch_stock_products():
+    """
+    Return list of branch products whose quantity is at or below reorder level.
+    """
+    low_stock_entries = (
+        BranchStock.objects
+            .values('product_id', 'product__name', 'product__sku', 'branch_id', 'branch__name')
+            .annotate(
+                total_quantity=Sum('quantity'),
+                reorder_level=Min('reorder_level')
+            )
+            .filter(reorder_level__isnull=False)
+            .filter(total_quantity__lte=F('reorder_level'))
+    )
+
+    results = []
+    for entry in low_stock_entries:
+        results.append({
+            'product_id': entry['product_id'],
+            'product_name': entry['product__name'],
+            'product_sku': entry['product__sku'],
+            'branch_id': entry['branch_id'],
+            'branch_name': entry['branch__name'],
+            'quantity': entry['total_quantity'],
+            'reorder_level': entry['reorder_level'],
+        })
+    return results
 
 def remove_stock_from_warehouse(
     product_id: int,
@@ -287,7 +353,8 @@ def remove_stock_from_warehouse(
     quantity: Decimal,
     reason: str = '',
     adjustment_type: str = 'removal',
-    created_by=None
+    created_by=None,
+    corrected_adjustment=None
 ) -> StockAdjustment:
     """
     Remove stock from warehouse.
@@ -325,10 +392,139 @@ def remove_stock_from_warehouse(
             adjustment_type=adjustment_type,
             quantity=-quantity,  # Negative for removal
             reason=reason or f'Stock removed: {adjustment_type}',
-            created_by=created_by
+            created_by=created_by,
+            corrected_adjustment=corrected_adjustment
         )
     
     return adjustment
+
+def increment_stock_entry(stock_entry_id: int, quantity: Decimal, reason: str = '', created_by=None, corrected_adjustment=None) -> StockEntry:
+    """
+    Increment stock entry quantity and create an addition adjustment.
+    """
+    with transaction.atomic():
+        stock_entry = StockEntry.objects.get(pk=stock_entry_id)
+        stock_entry.quantity += quantity
+        stock_entry.save()
+        
+        # Create adjustment record
+        StockAdjustment.objects.create(
+            product=stock_entry.product,
+            warehouse=stock_entry.warehouse,
+            adjustment_type='addition',
+            quantity=quantity,
+            purchase_price=stock_entry.purchase_price,
+            reason=reason or f'Stock entry incremented: {quantity} units added to batch {stock_entry.batch_number}',
+            created_by=created_by,
+            corrected_adjustment=corrected_adjustment
+        )
+    
+    return stock_entry
+
+
+def correct_stock_entry(
+    stock_entry_id: int,
+    new_quantity: Decimal,
+    reason: str = '',
+    created_by=None
+) -> Tuple[StockEntry, Optional[StockAdjustment]]:
+    """
+    Correct a stock entry's quantity and create a correction adjustment.
+    Handles both increases and decreases in quantity.
+    
+    For decreases: Reduces the specific stock entry and uses remove_stock_from_warehouse
+                   service pattern to create proper adjustment record (communicates with removal code).
+    For increases: Uses increment_stock_entry service to add quantity properly.
+    
+    The newly created adjustment will point to the most recent adjustment that was corrected.
+    
+    Returns:
+        Tuple of (updated_stock_entry, adjustment_record)
+    """
+    stock_entry = StockEntry.objects.get(pk=stock_entry_id)
+    original_quantity = stock_entry.quantity
+    quantity_diff = new_quantity - original_quantity
+    
+    if quantity_diff == 0:
+        # No change, return without creating adjustment
+        return stock_entry, None
+    
+    with transaction.atomic():
+        # Find the adjustment that was created when this stock entry was originally created
+        # Look for adjustments with same product, warehouse, purchase_price, and created around the same time
+        # This identifies the specific adjustment that created or modified this stock entry
+        from datetime import timedelta
+        
+        # Look for adjustments created around the time this stock entry was created
+        # (within 1 minute window, as they're created in the same transaction)
+        time_window_start = stock_entry.created_at - timedelta(minutes=1)
+        time_window_end = stock_entry.created_at + timedelta(minutes=1)
+        
+        original_adjustment = StockAdjustment.objects.filter(
+            product=stock_entry.product,
+            warehouse=stock_entry.warehouse,
+            purchase_price=stock_entry.purchase_price,
+            created_at__gte=time_window_start,
+            created_at__lte=time_window_end
+        ).exclude(adjustment_type='correction').order_by('created_at').first()
+        
+        # If no adjustment found with matching purchase_price and time window,
+        # fall back to finding the most recent adjustment before the stock entry was created
+        if not original_adjustment:
+            original_adjustment = StockAdjustment.objects.filter(
+                product=stock_entry.product,
+                warehouse=stock_entry.warehouse,
+                created_at__lte=stock_entry.created_at
+            ).exclude(adjustment_type='correction').order_by('-created_at').first()
+        
+        if quantity_diff < 0:
+            # Quantity decreased: use remove_stock_from_warehouse service
+            # This communicates with the removal code and handles stock removal properly
+            reduction_amount = abs(quantity_diff)
+            
+            # Use remove_stock_from_warehouse to handle the removal (uses FIFO)
+            adjustment = remove_stock_from_warehouse(
+                product_id=stock_entry.product_id,
+                warehouse_id=stock_entry.warehouse_id,
+                quantity=reduction_amount,
+                reason=reason or f'Stock entry corrected: {original_quantity} -> {new_quantity} units (reduced)',
+                adjustment_type='correction',
+                created_by=created_by,
+                corrected_adjustment=original_adjustment
+            )
+            
+            # Update the specific stock entry being edited to the new quantity
+            # Note: remove_stock_from_warehouse uses FIFO, so we adjust this entry to reflect the edit
+            stock_entry.refresh_from_db()
+            stock_entry.quantity = new_quantity
+            stock_entry.save()
+        else:
+            # Quantity increased: use increment_stock_entry service
+            stock_entry = increment_stock_entry(
+                stock_entry_id=stock_entry_id,
+                quantity=quantity_diff,
+                reason=reason or f'Stock entry corrected: {original_quantity} -> {new_quantity} units (increased)',
+                created_by=created_by,
+                corrected_adjustment=original_adjustment
+            )
+            # Get the adjustment that was created by increment_stock_entry
+            adjustment = StockAdjustment.objects.filter(
+                product=stock_entry.product,
+                warehouse=stock_entry.warehouse,
+                adjustment_type='addition',
+                created_by=created_by
+            ).order_by('-created_at').first()
+            
+            # Change it to correction type since this was from an edit
+            if adjustment:
+                adjustment.adjustment_type = 'correction'
+                adjustment.reason = reason or f'Stock entry corrected: {original_quantity} -> {new_quantity} units (increased)'
+                # Ensure corrected_adjustment is set (in case it wasn't set in increment_stock_entry)
+                if not adjustment.corrected_adjustment:
+                    adjustment.corrected_adjustment = original_adjustment
+                adjustment.save()
+    
+    return stock_entry, adjustment
 
 
 def bulk_add_stock_to_warehouse(stock_entries_data: List[Dict], created_by=None) -> Tuple[List[StockEntry], List[Dict]]:
@@ -721,6 +917,13 @@ def create_stock_transfer(
         transfer.full_clean()  # Validate the transfer
         transfer.save()  # This will auto-generate reference_number if empty
     
+    # Send notification email
+    try:
+        _send_stock_transfer_notification_email(transfer)
+    except Exception:
+        # Don't fail transfer creation if email fails
+        pass
+    
     return transfer
 
 
@@ -842,6 +1045,13 @@ def create_multi_product_stock_transfer(
                 notes=item_data.get('notes', '')
             )
     
+    # Send notification email
+    try:
+        _send_stock_transfer_notification_email(transfer)
+    except Exception:
+        # Don't fail transfer creation if email fails
+        pass
+    
     return transfer
 
 
@@ -873,6 +1083,15 @@ def complete_stock_transfer(transfer_id: int, completed_by=None) -> StockTransfe
         transfer.completed_by = completed_by
         transfer.completed_at = timezone.now()
         transfer.save()
+        
+        # Send invoice PDF via email to the destination manager
+        try:
+            send_transfer_invoice_email(transfer)
+        except Exception as e:
+            # Log error but don't fail the transfer completion
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f'Failed to send transfer invoice email: {str(e)}')
     
     return transfer
 
@@ -1036,32 +1255,71 @@ def _complete_single_product_transfer(transfer: StockTransfer, completed_by=None
             if selling_price is None:
                 selling_price = destination_purchase_price
             
-            # Generate new unique batch number for transferred stock
-            new_batch_number = generate_unique_batch_number()
-            transfer_notes = f'Transferred from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
-            if original_batch_str:
-                transfer_notes += f' (Original batch: {original_batch_str})'
-            if transfer.notes:
-                transfer_notes += f': {transfer.notes}'
+            # Check if stock already exists in the branch with same purchase price AND selling price
+            # Only increment if BOTH prices match exactly, otherwise create a new entry
+            existing_stock = None
             
-            BranchStock.objects.create(
-                product=transfer.product,
-                branch=transfer.destination_branch,
-                quantity=transfer.quantity,
-                purchase_price=destination_purchase_price,
-                selling_price=selling_price,
-                reorder_level=destination_reorder_level,
-                supplier_id=supplier_id,
-                batch_number=new_batch_number,
-                original_batch_number=original_batch_str,
-                notes=transfer_notes,
-                created_by=completed_by,
-                received_date=timezone.now(),
-                is_initial_stock=False,  # Branches only receive stock via transfers
-                source_transfer=transfer,
-                original_stock_entry=original_stock_entry,  # Link to original warehouse entry (if from warehouse)
-                original_branch_stock=original_branch_stock  # Link to original branch stock (if from branch)
-            )
+            # First, try to find existing stock with matching purchase price, selling price, and batch number (if available)
+            if original_batch_str:
+                existing_stock = BranchStock.objects.filter(
+                    product=transfer.product,
+                    branch=transfer.destination_branch,
+                    purchase_price=destination_purchase_price,
+                    selling_price=selling_price,
+                    original_batch_number=original_batch_str,
+                    quantity__gt=0
+                ).first()
+            
+            # If not found by batch, try to find by purchase price and selling price only
+            if not existing_stock:
+                existing_stock = BranchStock.objects.filter(
+                    product=transfer.product,
+                    branch=transfer.destination_branch,
+                    purchase_price=destination_purchase_price,
+                    selling_price=selling_price,
+                    quantity__gt=0
+                ).order_by('-received_date', '-created_at').first()
+            
+            if existing_stock:
+                # Increment existing stock entry
+                existing_stock.quantity += transfer.quantity
+                transfer_notes = f'Stock replenished via transfer from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
+                if original_batch_str:
+                    transfer_notes += f' (Original batch: {original_batch_str})'
+                if transfer.notes:
+                    transfer_notes += f': {transfer.notes}'
+                if existing_stock.notes:
+                    existing_stock.notes += f'\n{transfer_notes}'
+                else:
+                    existing_stock.notes = transfer_notes
+                existing_stock.save()
+            else:
+                # Create new stock entry
+                new_batch_number = generate_unique_batch_number()
+                transfer_notes = f'Transferred from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
+                if original_batch_str:
+                    transfer_notes += f' (Original batch: {original_batch_str})'
+                if transfer.notes:
+                    transfer_notes += f': {transfer.notes}'
+                
+                BranchStock.objects.create(
+                    product=transfer.product,
+                    branch=transfer.destination_branch,
+                    quantity=transfer.quantity,
+                    purchase_price=destination_purchase_price,
+                    selling_price=selling_price,
+                    reorder_level=destination_reorder_level,
+                    supplier_id=supplier_id,
+                    batch_number=new_batch_number,
+                    original_batch_number=original_batch_str,
+                    notes=transfer_notes,
+                    created_by=completed_by,
+                    received_date=timezone.now(),
+                    is_initial_stock=False,  # Branches only receive stock via transfers
+                    source_transfer=transfer,
+                    original_stock_entry=original_stock_entry,  # Link to original warehouse entry (if from warehouse)
+                    original_branch_stock=original_branch_stock  # Link to original branch stock (if from branch)
+                )
 
 
 def _complete_multi_product_transfer(transfer: StockTransfer, items, completed_by=None):
@@ -1212,33 +1470,75 @@ def _complete_multi_product_transfer(transfer: StockTransfer, items, completed_b
             if selling_price is None:
                 selling_price = destination_purchase_price
             
-            new_batch_number = generate_unique_batch_number()
-            transfer_notes = f'Transferred from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
-            if original_batch_str:
-                transfer_notes += f' (Original batch: {original_batch_str})'
-            if item.notes:
-                transfer_notes += f': {item.notes}'
-            if transfer.notes:
-                transfer_notes += f' | Transfer: {transfer.notes}'
+            # Check if stock already exists in the branch with same purchase price AND selling price
+            # Only increment if BOTH prices match exactly, otherwise create a new entry
+            existing_stock = None
             
-            BranchStock.objects.create(
-                product=item.product,
-                branch=transfer.destination_branch,
-                quantity=item.quantity,
-                purchase_price=destination_purchase_price,
-                selling_price=selling_price,
-                reorder_level=destination_reorder_level,
-                supplier_id=supplier_id,
-                batch_number=new_batch_number,
-                original_batch_number=original_batch_str,
-                notes=transfer_notes,
-                created_by=completed_by,
-                received_date=timezone.now(),
-                is_initial_stock=False,
-                source_transfer=transfer,
-                original_stock_entry=original_stock_entry,
-                original_branch_stock=original_branch_stock
-            )
+            # First, try to find existing stock with matching purchase price, selling price, and batch number (if available)
+            if original_batch_str:
+                existing_stock = BranchStock.objects.filter(
+                    product=item.product,
+                    branch=transfer.destination_branch,
+                    purchase_price=destination_purchase_price,
+                    selling_price=selling_price,
+                    original_batch_number=original_batch_str,
+                    quantity__gt=0
+                ).first()
+            
+            # If not found by batch, try to find by purchase price and selling price only
+            if not existing_stock:
+                existing_stock = BranchStock.objects.filter(
+                    product=item.product,
+                    branch=transfer.destination_branch,
+                    purchase_price=destination_purchase_price,
+                    selling_price=selling_price,
+                    quantity__gt=0
+                ).order_by('-received_date', '-created_at').first()
+            
+            if existing_stock:
+                # Increment existing stock entry
+                existing_stock.quantity += item.quantity
+                transfer_notes = f'Stock replenished via transfer from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
+                if original_batch_str:
+                    transfer_notes += f' (Original batch: {original_batch_str})'
+                if item.notes:
+                    transfer_notes += f': {item.notes}'
+                if transfer.notes:
+                    transfer_notes += f' | Transfer: {transfer.notes}'
+                if existing_stock.notes:
+                    existing_stock.notes += f'\n{transfer_notes}'
+                else:
+                    existing_stock.notes = transfer_notes
+                existing_stock.save()
+            else:
+                # Create new stock entry
+                new_batch_number = generate_unique_batch_number()
+                transfer_notes = f'Transferred from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
+                if original_batch_str:
+                    transfer_notes += f' (Original batch: {original_batch_str})'
+                if item.notes:
+                    transfer_notes += f': {item.notes}'
+                if transfer.notes:
+                    transfer_notes += f' | Transfer: {transfer.notes}'
+                
+                BranchStock.objects.create(
+                    product=item.product,
+                    branch=transfer.destination_branch,
+                    quantity=item.quantity,
+                    purchase_price=destination_purchase_price,
+                    selling_price=selling_price,
+                    reorder_level=destination_reorder_level,
+                    supplier_id=supplier_id,
+                    batch_number=new_batch_number,
+                    original_batch_number=original_batch_str,
+                    notes=transfer_notes,
+                    created_by=completed_by,
+                    received_date=timezone.now(),
+                    is_initial_stock=False,
+                    source_transfer=transfer,
+                    original_stock_entry=original_stock_entry,
+                    original_branch_stock=original_branch_stock
+                )
         transfer.status = 'completed'
         transfer.completed_by = completed_by
         transfer.completed_at = timezone.now()
@@ -1318,4 +1618,597 @@ def bulk_create_stock_transfers(transfers_data: List[Dict], created_by=None) -> 
                 # Continue with next transfer even if one fails
     
     return created_transfers, errors
+
+
+def _send_stock_transfer_notification_email(transfer: StockTransfer) -> None:
+    """
+    Send email notification when a stock transfer is created.
+    Notifies:
+    - Admin who is the warehouse manager for the main warehouse
+    - Warehouse manager for the source warehouse (if source is a warehouse)
+    - Branch manager for the source branch (if source is a branch)
+    """
+    api_key = getattr(settings, 'MAILJET_API_KEY', '')
+    api_secret = getattr(settings, 'MAILJET_API_SECRET', '')
+    if not api_key or not api_secret:
+        return  # Silently fail if email is not configured
+    
+    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@decormasters.com')
+    company_name = getattr(settings, 'COMPANY_NAME', 'Decor Masters')
+    mailjet = Client(auth=(api_key, api_secret), version='v3.1')
+    
+    # Get transfer details
+    transfer_type_display = transfer.get_transfer_type_display()
+    source_name = transfer.source_warehouse.name if transfer.source_warehouse else (transfer.source_branch.name if transfer.source_branch else 'Unknown')
+    destination_name = transfer.destination_warehouse.name if transfer.destination_warehouse else (transfer.destination_branch.name if transfer.destination_branch else 'Unknown')
+    reference_number = transfer.reference_number
+    created_by_name = transfer.created_by.email if transfer.created_by else 'System'
+    
+    # Get product details (for single-product transfers)
+    product_name = None
+    product_sku = None
+    quantity = Decimal('0')
+    
+    if transfer.product:
+        product_name = transfer.product.name
+        product_sku = transfer.product.sku
+        quantity = transfer.quantity
+        items_summary = f"<tr><td>{product_name} ({product_sku})</td><td style='text-align: right;'>{quantity}</td></tr>"
+    else:
+        # Multi-product transfer
+        items = transfer.items.all()
+        items_summary = ""
+        total_quantity = Decimal('0')
+        for item in items:
+            items_summary += f"<tr><td>{item.product.name} ({item.product.sku})</td><td style='text-align: right;'>{item.quantity}</td></tr>"
+            total_quantity += item.quantity
+        quantity = total_quantity
+    
+    # Collect recipients
+    recipients = []
+    
+    # 1. Admin who is the warehouse manager for the main warehouse
+    main_warehouse = Warehouse.objects.filter(is_main=True).first()
+    if main_warehouse:
+        # Get admins/owners
+        admins = User.objects.filter(
+            role__in=['admin', 'owner'],
+            is_active=True,
+            account_status='active'
+        ).prefetch_related('profile')
+        
+        for admin in admins:
+            employee = admin.profile.first() if hasattr(admin, 'profile') else None
+            # Check if admin is warehouse manager for main warehouse
+            if employee and employee.warehouse == main_warehouse:
+                recipients.append({
+                    'email': admin.email,
+                    'name': employee.get_full_name() if employee and employee.get_full_name() else admin.email,
+                    'role': 'Admin (Main Warehouse Manager)',
+                })
+    
+    # 2. Warehouse manager for the source warehouse (if source is a warehouse)
+    if transfer.source_warehouse:
+        warehouse_managers = User.objects.filter(
+            role='warehouse_manager',
+            is_active=True,
+            account_status='active',
+            profile__warehouse=transfer.source_warehouse
+        ).prefetch_related('profile').distinct()
+        
+        for manager in warehouse_managers:
+            employee = manager.profile.first() if hasattr(manager, 'profile') else None
+            if employee and employee.warehouse == transfer.source_warehouse:
+                recipients.append({
+                    'email': manager.email,
+                    'name': employee.get_full_name() if employee and employee.get_full_name() else manager.email,
+                    'role': f'Warehouse Manager ({transfer.source_warehouse.name})',
+                })
+    
+    # 3. Branch manager for the source branch (if source is a branch)
+    if transfer.source_branch:
+        branch_managers = User.objects.filter(
+            role='branch_manager',
+            is_active=True,
+            account_status='active',
+            profile__branch=transfer.source_branch
+        ).prefetch_related('profile').distinct()
+        
+        for manager in branch_managers:
+            employee = manager.profile.first() if hasattr(manager, 'profile') else None
+            if employee and employee.branch == transfer.source_branch:
+                recipients.append({
+                    'email': manager.email,
+                    'name': employee.get_full_name() if employee and employee.get_full_name() else manager.email,
+                    'role': f'Branch Manager ({transfer.source_branch.name})',
+                })
+    
+    # Remove duplicates based on email
+    seen_emails = set()
+    unique_recipients = []
+    for recipient in recipients:
+        if recipient['email'] not in seen_emails:
+            seen_emails.add(recipient['email'])
+            unique_recipients.append(recipient)
+    
+    if not unique_recipients:
+        return  # No recipients to notify
+    
+    # Prepare email content
+    subject = f'New Stock Transfer Request - {reference_number}'
+    html_content = f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 800px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #0f766e;">📦 New Stock Transfer Request</h2>
+                <p>A new stock transfer request has been created and requires your attention.</p>
+                
+                <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                    <tr>
+                        <td style="padding: 8px; font-weight: bold; width: 200px;">Transfer Reference:</td>
+                        <td style="padding: 8px;">{reference_number}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; font-weight: bold;">Transfer Type:</td>
+                        <td style="padding: 8px;">{transfer_type_display}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; font-weight: bold;">Source:</td>
+                        <td style="padding: 8px;">{source_name}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; font-weight: bold;">Destination:</td>
+                        <td style="padding: 8px;">{destination_name}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; font-weight: bold;">Created By:</td>
+                        <td style="padding: 8px;">{created_by_name}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; font-weight: bold;">Status:</td>
+                        <td style="padding: 8px;"><strong style="color: #ffc107;">Pending</strong></td>
+                    </tr>
+                </table>
+                
+                <h3 style="color: #0f766e; margin-top: 30px;">Items:</h3>
+                <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                    <thead>
+                        <tr style="background-color: #0f766e; color: white;">
+                            <th style="padding: 10px; text-align: left;">Product</th>
+                            <th style="padding: 10px; text-align: right;">Quantity</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {items_summary}
+                    </tbody>
+                </table>
+                
+                {f'<p><strong>Notes:</strong> {transfer.notes}</p>' if transfer.notes else ''}
+                
+                <p style="color: #856404; background-color: #fff3cd; padding: 15px; border-left: 4px solid #ffc107; margin: 20px 0;">
+                    <strong>Action Required:</strong> Please review and process this stock transfer request.
+                </p>
+                
+                <p>Regards,<br>{company_name}</p>
+            </div>
+        </body>
+    </html>
+    """
+    
+    text_content = f"""
+    New Stock Transfer Request
+    
+    A new stock transfer request has been created and requires your attention.
+    
+    Transfer Reference: {reference_number}
+    Transfer Type: {transfer_type_display}
+    Source: {source_name}
+    Destination: {destination_name}
+    Created By: {created_by_name}
+    Status: Pending
+    
+    Items:
+    """
+    
+    if transfer.product:
+        text_content += f"\n- {product_name} ({product_sku}): {quantity}"
+    else:
+        items = transfer.items.all()
+        for item in items:
+            text_content += f"\n- {item.product.name} ({item.product.sku}): {item.quantity}"
+    
+    if transfer.notes:
+        text_content += f"\n\nNotes: {transfer.notes}"
+    
+    text_content += f"\n\nAction Required: Please review and process this stock transfer request.\n\nRegards,\n{company_name}"
+    
+    # Send email to each recipient
+    for recipient in unique_recipients:
+        try:
+            data = {
+                'Messages': [
+                    {
+                        'From': {'Email': from_email, 'Name': company_name},
+                        'To': [{'Email': recipient['email'], 'Name': recipient['name']}],
+                        'Subject': subject,
+                        'TextPart': text_content,
+                        'HTMLPart': html_content,
+                    }
+                ]
+            }
+            mailjet.send.create(data=data)
+        except Exception:
+            # Silently fail for individual email failures
+            pass
+
+
+def generate_transfer_invoice_pdf(transfer: StockTransfer) -> bytes:
+    """
+    Generate a professional invoice PDF for a stock transfer.
+    Returns the PDF as bytes.
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=0.5*inch, bottomMargin=0.5*inch)
+    story = []
+    
+    styles = getSampleStyleSheet()
+    
+    # Custom styles
+    title_style = ParagraphStyle(
+        'InvoiceTitle',
+        parent=styles['Heading1'],
+        fontSize=24,
+        textColor=colors.HexColor('#0f766e'),
+        spaceAfter=20,
+        alignment=1,  # Center
+        fontName='Helvetica-Bold',
+    )
+    
+    heading_style = ParagraphStyle(
+        'InvoiceHeading',
+        parent=styles['Heading2'],
+        fontSize=14,
+        textColor=colors.HexColor('#0f172a'),
+        spaceAfter=8,
+        spaceBefore=12,
+        fontName='Helvetica-Bold',
+    )
+    
+    normal_style = ParagraphStyle(
+        'InvoiceNormal',
+        parent=styles['Normal'],
+        fontSize=10,
+        textColor=colors.HexColor('#1e293b'),
+    )
+    
+    company_style = ParagraphStyle(
+        'CompanyStyle',
+        parent=styles['Normal'],
+        fontSize=12,
+        textColor=colors.HexColor('#0f172a'),
+        fontName='Helvetica-Bold',
+    )
+    
+    # Company header
+    company_name = getattr(settings, 'COMPANY_NAME', 'Decor Masters')
+    company_address = getattr(settings, 'COMPANY_ADDRESS', '')
+    
+    # Header section
+    header_data = [
+        [Paragraph(f'<b>{company_name}</b>', company_style), Paragraph('INVOICE', title_style)],
+    ]
+    if company_address:
+        header_data.append([Paragraph(company_address, normal_style), ''])
+    
+    header_table = Table(header_data, colWidths=[4*inch, 2.5*inch])
+    header_table.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    story.append(header_table)
+    story.append(Spacer(1, 0.3*inch))
+    
+    # Transfer details
+    source_name = transfer.source_warehouse.name if transfer.source_warehouse else (
+        transfer.source_branch.name if transfer.source_branch else 'Unknown'
+    )
+    destination_name = transfer.destination_warehouse.name if transfer.destination_warehouse else (
+        transfer.destination_branch.name if transfer.destination_branch else 'Unknown'
+    )
+    
+    # Details section
+    details_data = [
+        [Paragraph('<b>Transfer Details</b>', heading_style), ''],
+        ['Reference Number:', transfer.reference_number or 'N/A'],
+        ['Transfer Type:', transfer.get_transfer_type_display()],
+        ['From:', source_name],
+        ['To:', destination_name],
+        ['Date:', transfer.completed_at.strftime('%B %d, %Y %I:%M %p') if transfer.completed_at else transfer.created_at.strftime('%B %d, %Y %I:%M %p')],
+        ['Status:', transfer.get_status_display()],
+    ]
+    
+    if transfer.created_by:
+        details_data.append(['Created By:', transfer.created_by.email])
+    if transfer.completed_by:
+        details_data.append(['Completed By:', transfer.completed_by.email])
+    
+    details_table = Table(details_data, colWidths=[2*inch, 4.5*inch])
+    details_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0f766e')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f8fafc')),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 1), (-1, -1), 10),
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#e2e8f0')),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f8fafc')]),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
+    ]))
+    story.append(details_table)
+    story.append(Spacer(1, 0.3*inch))
+    
+    # Items table
+    story.append(Paragraph('<b>Items Transferred</b>', heading_style))
+    
+    # Get transfer items
+    items = transfer.items.all() if hasattr(transfer, 'items') and transfer.items.exists() else []
+    
+    if items:
+        # Multi-product transfer
+        items_data = [['#', 'Product', 'SKU', 'Quantity', 'Unit Price', 'Total']]
+        total_amount = Decimal('0')
+        
+        for idx, item in enumerate(items, 1):
+            unit_price = item.purchase_price or Decimal('0')
+            total_price = item.quantity * unit_price
+            total_amount += total_price
+            
+            items_data.append([
+                str(idx),
+                item.product.name[:40] + '...' if len(item.product.name) > 40 else item.product.name,
+                item.product.sku or 'N/A',
+                f"{item.quantity:,.2f}",
+                f"${unit_price:,.2f}",
+                f"${total_price:,.2f}",
+            ])
+    else:
+        # Single product transfer (legacy)
+        items_data = [['#', 'Product', 'SKU', 'Quantity', 'Unit Price', 'Total']]
+        if transfer.product:
+            unit_price = transfer.purchase_price or Decimal('0')
+            total_price = transfer.quantity * unit_price if transfer.quantity else Decimal('0')
+            
+            items_data.append([
+                '1',
+                transfer.product.name[:40] + '...' if len(transfer.product.name) > 40 else transfer.product.name,
+                transfer.product.sku or 'N/A',
+                f"{transfer.quantity:,.2f}" if transfer.quantity else '0.00',
+                f"${unit_price:,.2f}",
+                f"${total_price:,.2f}",
+            ])
+            total_amount = total_price
+        else:
+            total_amount = Decimal('0')
+    
+    items_table = Table(items_data, colWidths=[0.4*inch, 2*inch, 0.8*inch, 0.8*inch, 1*inch, 1*inch])
+    items_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0f766e')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+        ('ALIGN', (3, 0), (-1, -1), 'RIGHT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 11),
+        ('FONTSIZE', (0, 1), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('TOPPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#e2e8f0')),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f8fafc')]),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 6),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 1), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
+    ]))
+    story.append(items_table)
+    story.append(Spacer(1, 0.2*inch))
+    
+    # Total section
+    total_data = [
+        ['', '', '', '', Paragraph('<b>Total Amount:</b>', normal_style), Paragraph(f'<b>${total_amount:,.2f}</b>', normal_style)],
+    ]
+    
+    total_table = Table(total_data, colWidths=[0.4*inch, 2*inch, 0.8*inch, 0.8*inch, 1*inch, 1*inch])
+    total_table.setStyle(TableStyle([
+        ('ALIGN', (4, 0), (-1, 0), 'RIGHT'),
+        ('FONTNAME', (4, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (4, 0), (-1, 0), 11),
+        ('BACKGROUND', (4, 0), (-1, 0), colors.HexColor('#f1f5f9')),
+        ('TOPPADDING', (4, 0), (-1, 0), 10),
+        ('BOTTOMPADDING', (4, 0), (-1, 0), 10),
+        ('LEFTPADDING', (4, 0), (-1, 0), 8),
+        ('RIGHTPADDING', (4, 0), (-1, 0), 8),
+    ]))
+    story.append(total_table)
+    story.append(Spacer(1, 0.3*inch))
+    
+    # Notes section
+    if transfer.notes:
+        story.append(Paragraph('<b>Notes</b>', heading_style))
+        story.append(Paragraph(transfer.notes, normal_style))
+        story.append(Spacer(1, 0.2*inch))
+    
+    # Footer
+    footer_text = f'This is an automated invoice for stock transfer {transfer.reference_number}.'
+    story.append(Spacer(1, 0.3*inch))
+    story.append(Paragraph(f'<i>{footer_text}</i>', ParagraphStyle(
+        'Footer',
+        parent=normal_style,
+        fontSize=8,
+        textColor=colors.HexColor('#64748b'),
+        alignment=1,  # Center
+    )))
+    
+    # Build PDF
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def send_transfer_invoice_email(transfer: StockTransfer) -> None:
+    """
+    Send transfer invoice PDF via email to the destination manager (warehouse manager or branch manager).
+    """
+    api_key = getattr(settings, 'MAILJET_API_KEY', '')
+    api_secret = getattr(settings, 'MAILJET_API_SECRET', '')
+    if not api_key or not api_secret:
+        return  # Silently fail if email is not configured
+    
+    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@decormasters.com')
+    company_name = getattr(settings, 'COMPANY_NAME', 'Decor Masters')
+    mailjet = Client(auth=(api_key, api_secret), version='v3.1')
+    
+    # Get destination manager
+    recipient_email = None
+    recipient_name = None
+    
+    # Check if destination is a warehouse
+    if transfer.destination_warehouse:
+        warehouse_managers = User.objects.filter(
+            role='warehouse_manager',
+            is_active=True,
+            account_status='active',
+            profile__warehouse=transfer.destination_warehouse
+        ).prefetch_related('profile').distinct()
+        
+        for manager in warehouse_managers:
+            employee = manager.profile.first() if hasattr(manager, 'profile') else None
+            if employee and employee.warehouse == transfer.destination_warehouse:
+                recipient_email = manager.email
+                recipient_name = employee.get_full_name() if employee and employee.get_full_name() else manager.email
+                break
+    
+    # Check if destination is a branch
+    elif transfer.destination_branch:
+        branch_managers = User.objects.filter(
+            role='branch_manager',
+            is_active=True,
+            account_status='active',
+            profile__branch=transfer.destination_branch
+        ).prefetch_related('profile').distinct()
+        
+        for manager in branch_managers:
+            employee = manager.profile.first() if hasattr(manager, 'profile') else None
+            if employee and employee.branch == transfer.destination_branch:
+                recipient_email = manager.email
+                recipient_name = employee.get_full_name() if employee and employee.get_full_name() else manager.email
+                break
+    
+    # If no manager found, don't send email
+    if not recipient_email:
+        return
+    
+    # Generate PDF invoice
+    pdf_bytes = generate_transfer_invoice_pdf(transfer)
+    pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
+    
+    # Prepare email content
+    source_name = transfer.source_warehouse.name if transfer.source_warehouse else (
+        transfer.source_branch.name if transfer.source_branch else 'Unknown'
+    )
+    destination_name = transfer.destination_warehouse.name if transfer.destination_warehouse else (
+        transfer.destination_branch.name if transfer.destination_branch else 'Unknown'
+    )
+    
+    subject = f'Stock Transfer Invoice - {transfer.reference_number}'
+    
+    html_content = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #0f766e;">Stock Transfer Invoice</h2>
+            <p>Dear {recipient_name},</p>
+            <p>Your stock transfer request has been completed successfully.</p>
+            <p><strong>Transfer Details:</strong></p>
+            <ul>
+                <li><strong>Reference Number:</strong> {transfer.reference_number or 'N/A'}</li>
+                <li><strong>From:</strong> {source_name}</li>
+                <li><strong>To:</strong> {destination_name}</li>
+                <li><strong>Date:</strong> {transfer.completed_at.strftime('%B %d, %Y %I:%M %p') if transfer.completed_at else transfer.created_at.strftime('%B %d, %Y %I:%M %p')}</li>
+            </ul>
+            <p>Please find the detailed invoice attached as a PDF document.</p>
+            <p>If you have any questions, please contact the system administrator.</p>
+            <p>Best regards,<br>{company_name}</p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    text_content = f"""
+    Stock Transfer Invoice
+    
+    Dear {recipient_name},
+    
+    Your stock transfer request has been completed successfully.
+    
+    Transfer Details:
+    - Reference Number: {transfer.reference_number or 'N/A'}
+    - From: {source_name}
+    - To: {destination_name}
+    - Date: {transfer.completed_at.strftime('%B %d, %Y %I:%M %p') if transfer.completed_at else transfer.created_at.strftime('%B %d, %Y %I:%M %p')}
+    
+    Please find the detailed invoice attached as a PDF document.
+    
+    Best regards,
+    {company_name}
+    """
+    
+    # Send email
+    pdf_filename = f'transfer_invoice_{transfer.reference_number or transfer.id}.pdf'
+    
+    data = {
+        'Messages': [
+            {
+                'From': {
+                    'Email': from_email,
+                    'Name': company_name
+                },
+                'To': [
+                    {
+                        'Email': recipient_email,
+                        'Name': recipient_name
+                    }
+                ],
+                'Subject': subject,
+                'TextPart': text_content,
+                'HTMLPart': html_content,
+                'Attachments': [
+                    {
+                        'ContentType': 'application/pdf',
+                        'Filename': pdf_filename,
+                        'Base64Content': pdf_base64
+                    }
+                ]
+            }
+        ]
+    }
+    
+    try:
+        result = mailjet.send.create(data=data)
+        if result.status_code not in (200, 201):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f'Failed to send transfer invoice email: Status {result.status_code}')
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f'Error sending transfer invoice email: {str(e)}')
 

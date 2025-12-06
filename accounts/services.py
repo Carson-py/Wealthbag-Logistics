@@ -102,11 +102,11 @@ def send_new_account_email(user: User, password: str, employee: Employee) -> Non
     """
     Send a welcome email to the newly created user containing their temporary password via Mailjet.
     """
-    subject = 'Welcome to WealthBag Logistics'
-    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@wealthbaglogistics.com')
-    company_name = getattr(settings, 'COMPANY_NAME', 'WealthBag Logistics')
+    subject = 'Welcome to Decor Masters'
+    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@decormasters.com')
+    company_name = getattr(settings, 'COMPANY_NAME', 'Decor Masters')
     logo_url = getattr(settings, 'COMPANY_LOGO_URL')
-    support_email = getattr(settings, 'SUPPORT_EMAIL', 'support@wealthbaglogistics.com')
+    support_email = getattr(settings, 'SUPPORT_EMAIL', 'support@decormasters.com')
 
     context = {
         'user': user,
@@ -196,11 +196,11 @@ def send_account_blocked_email(user: User) -> None:
     """
     Notify the user that their account has been blocked.
     """
-    subject = 'Your WealthBag Logistics account has been blocked'
-    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@wealthbaglogistics.com')
-    company_name = getattr(settings, 'COMPANY_NAME', 'WealthBag Logistics')
+    subject = 'Your Decor Masters account has been blocked'
+    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@decormasters.com')
+    company_name = getattr(settings, 'COMPANY_NAME', 'Decor Masters')
     logo_url = getattr(settings, 'COMPANY_LOGO_URL')
-    support_email = getattr(settings, 'SUPPORT_EMAIL', 'support@wealthbaglogistics.com')
+    support_email = getattr(settings, 'SUPPORT_EMAIL', 'support@decormasters.com')
 
     employee = user.profile.first() if hasattr(user, 'profile') else None
     full_name = employee.get_full_name() if employee else user.email
@@ -231,11 +231,11 @@ def send_account_unblocked_email(user: User) -> None:
     """
     Notify the user that their account has been reinstated.
     """
-    subject = 'Your WealthBag Logistics account has been reinstated'
-    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@wealthbaglogistics.com')
-    company_name = getattr(settings, 'COMPANY_NAME', 'WealthBag Logistics')
+    subject = 'Your Decor Masters account has been reinstated'
+    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@decormasters.com')
+    company_name = getattr(settings, 'COMPANY_NAME', 'Decor Masters')
     logo_url = getattr(settings, 'COMPANY_LOGO_URL')
-    support_email = getattr(settings, 'SUPPORT_EMAIL', 'support@wealthbaglogistics.com')
+    support_email = getattr(settings, 'SUPPORT_EMAIL', 'support@decormasters.com')
 
     employee = user.profile.first() if hasattr(user, 'profile') else None
     full_name = employee.get_full_name() if employee else user.email
@@ -307,10 +307,10 @@ def send_password_changed_email(user: User) -> None:
     Notify the user that their password has been successfully changed.
     """
     subject = 'Your password has been changed'
-    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@wealthbaglogistics.com')
-    company_name = getattr(settings, 'COMPANY_NAME', 'WealthBag Logistics')
+    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@decormasters.com')
+    company_name = getattr(settings, 'COMPANY_NAME', 'Decor Masters')
     logo_url = getattr(settings, 'COMPANY_LOGO_URL')
-    support_email = getattr(settings, 'SUPPORT_EMAIL', 'support@wealthbaglogistics.com')
+    support_email = getattr(settings, 'SUPPORT_EMAIL', 'support@decormasters.com')
 
     employee = user.profile.first() if hasattr(user, 'profile') else None
     full_name = employee.get_full_name() if employee else user.email
@@ -342,10 +342,10 @@ def send_password_reset_email(user: User, new_password: str) -> None:
     Send the user their new temporary password after reset.
     """
     subject = 'Your password has been reset'
-    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@wealthbaglogistics.com')
-    company_name = getattr(settings, 'COMPANY_NAME', 'WealthBag Logistics')
+    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@decormasters.com')
+    company_name = getattr(settings, 'COMPANY_NAME', 'Decor Masters')
     logo_url = getattr(settings, 'COMPANY_LOGO_URL')
-    support_email = getattr(settings, 'SUPPORT_EMAIL', 'support@wealthbaglogistics.com')
+    support_email = getattr(settings, 'SUPPORT_EMAIL', 'support@decormasters.com')
 
     employee = user.profile.first() if hasattr(user, 'profile') else None
     full_name = employee.get_full_name() if employee else user.email

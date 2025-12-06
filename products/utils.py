@@ -155,6 +155,58 @@ def scan_barcode_from_file(file) -> Optional[str]:
         return None
 
 
+def _create_high_contrast_barcode_buffer(source_buffer: io.BytesIO, dpi: int) -> io.BytesIO:
+    """
+    Ensure the generated barcode is high-contrast and printer-friendly.
+    Converts to 1-bit monochrome with embedded DPI metadata so Zebra printers
+    render crisp bars without fuzzy edges.
+    """
+    if not PIL_AVAILABLE:
+        source_buffer.seek(0)
+        return source_buffer
+    
+    source_buffer.seek(0)
+    image = Image.open(source_buffer)
+    
+    # Convert to grayscale then threshold to pure black/white
+    if image.mode != 'L':
+        image = image.convert('L')
+    
+    image = image.point(lambda x: 0 if x < 200 else 255, '1')
+    
+    target_min_width = 700
+    if image.width < target_min_width:
+        scale_factor = max(1, int(target_min_width / max(1, image.width)))
+        if scale_factor > 1:
+            image = image.resize(
+                (image.width * scale_factor, image.height * scale_factor),
+                resample=Image.NEAREST
+            )
+    
+    processed_buffer = io.BytesIO()
+    image.save(processed_buffer, format='PNG', dpi=(dpi, dpi), optimize=True)
+    processed_buffer.seek(0)
+    return processed_buffer
+
+
+def _get_barcode_writer_options() -> dict:
+    """
+    Centralized writer options tuned for thermal label printers (e.g. Zebra).
+    Wider module width + larger quiet zone improves readability when printed.
+    """
+    return {
+        'module_width': 0.5,        # Wider bars for thermal transfer
+        'module_height': 22.0,      # Taller bars for 1.25\" labels
+        'quiet_zone': 7.0,
+        'font_size': 16,            # Slightly smaller text
+        'text_distance': 10.0,      # Move text further below bars
+        'dpi': 600,                 # High DPI for crisp printing
+        'background': 'white',
+        'foreground': 'black',
+        'write_text': True,
+    }
+
+
 def generate_barcode_image(barcode_value: str) -> Optional[InMemoryUploadedFile]:
     """
     Generate a barcode image from a barcode value using CODE128 format.
@@ -171,22 +223,24 @@ def generate_barcode_image(barcode_value: str) -> Optional[InMemoryUploadedFile]
         return None
     
     try:
-        # Always use CODE128 format
+        # Always use CODE128 format with tuned writer options
+        writer_options = _get_barcode_writer_options()
         code_class = barcode.get_barcode_class('code128')
         code = code_class(barcode_value, writer=ImageWriter())
         
-        # Create in-memory file
         buffer = io.BytesIO()
-        code.write(buffer)
-        buffer.seek(0)
+        code.write(buffer, options=writer_options)
+        
+        # Ensure crisp 1-bit output with embedded DPI metadata
+        processed_buffer = _create_high_contrast_barcode_buffer(buffer, dpi=writer_options['dpi'])
         
         # Create Django InMemoryUploadedFile
         image_file = InMemoryUploadedFile(
-            buffer,
+            processed_buffer,
             None,
             f'{barcode_value}.png',
             'image/png',
-            buffer.tell(),
+            processed_buffer.getbuffer().nbytes,
             None
         )
         
@@ -214,18 +268,36 @@ def generate_barcode_image_file(barcode_value: str, output_path: str = None) -> 
     try:
         import tempfile
         
-        # Always use CODE128 format
+        writer_options = _get_barcode_writer_options()
         code_class = barcode.get_barcode_class('code128')
         code = code_class(barcode_value, writer=ImageWriter())
         
-        # Save to file
         if not output_path:
             output_path = os.path.join(tempfile.gettempdir(), f'{barcode_value}.png')
         
-        code.save(output_path.replace('.png', ''))  # Save without extension, library adds it
+        base_path = output_path.replace('.png', '')
+        tmp_path = code.save(base_path, options=writer_options)
+        saved_path = f"{base_path}.png"
         
-        # Return path with extension
-        return f"{output_path.replace('.png', '')}.png"
+        # Post-process for high-contrast thermal printing
+        if PIL_AVAILABLE:
+            with Image.open(saved_path) as image:
+                if image.mode != 'L':
+                    image = image.convert('L')
+                image = image.point(lambda x: 0 if x < 200 else 255, '1')
+                
+                target_min_width = 700
+                if image.width < target_min_width:
+                    scale_factor = max(1, int(target_min_width / max(1, image.width)))
+                    if scale_factor > 1:
+                        image = image.resize(
+                            (image.width * scale_factor, image.height * scale_factor),
+                            resample=Image.NEAREST
+                        )
+                
+                image.save(saved_path, format='PNG', dpi=(writer_options['dpi'], writer_options['dpi']), optimize=True)
+        
+        return saved_path
         
     except Exception as e:
         print(f"Error generating barcode image file: {str(e)}")

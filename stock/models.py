@@ -127,8 +127,7 @@ class StockAdjustment(models.Model):
         ('addition', 'Addition'),
         ('removal', 'Removal'),
         ('correction', 'Correction'),
-        ('damaged', 'Damaged'),
-        ('returned', 'Returned'),
+        ('damaged', 'Damaged')
     ]
     
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='stock_adjustments')
@@ -141,6 +140,12 @@ class StockAdjustment(models.Model):
     reference_number = models.CharField(max_length=100, blank=True, verbose_name='Reference Number')
     created_by = models.ForeignKey('accounts.User', on_delete=models.SET_NULL, null=True, related_name='created_adjustments')
     created_at = models.DateTimeField(auto_now_add=True)
+    corrected_adjustment = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True,
+                                             related_name='correction_adjustments', verbose_name='Corrected Adjustment',
+                                             help_text='The adjustment that was corrected by this adjustment')
+    corrected_adjustment = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True,
+                                             related_name='correction_adjustments', verbose_name='Corrected Adjustment',
+                                             help_text='The adjustment that was corrected by this adjustment')
     
     class Meta:
         ordering = ['-created_at']

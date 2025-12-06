@@ -143,16 +143,23 @@ class RemoveStockSerializer(serializers.Serializer):
     quantity = serializers.DecimalField(max_digits=12, decimal_places=2, required=True)
     reason = serializers.CharField(required=False, allow_blank=True)
     adjustment_type = serializers.ChoiceField(
-        choices=['removal', 'damaged', 'expired', 'correction'],
-        default='removal'
+        choices=[('removal', 'Removal'), ('damaged', 'Damaged')],
+        required=True,
+        help_text='Specify if stock is being removed normally or written off as damaged.'
     )
+
+
+class IncrementStockEntrySerializer(serializers.Serializer):
+    stock_entry_id = serializers.IntegerField(required=True, help_text='ID of the stock entry to increment')
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=2, required=True, help_text='Quantity to add to the stock entry')
+    reason = serializers.CharField(required=False, allow_blank=True, help_text='Reason for the increment (optional)')
 
 
 class BranchStockSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_sku = serializers.CharField(source='product.sku', read_only=True)
     branch_name = serializers.CharField(source='branch.name', read_only=True)
-    warehouse_name = serializers.CharField(source='branch.warehouse.name', read_only=True)
+    warehouse_name = serializers.CharField(source='branch.warehouse.name', read_only=True, allow_null=True)
     supplier_name = serializers.CharField(source='supplier.name', read_only=True)
     created_by_email = serializers.CharField(source='created_by.email', read_only=True)
     total_cost = serializers.ReadOnlyField()
@@ -188,6 +195,26 @@ class StockTransferItemSerializer(serializers.ModelSerializer):
             'notes', 'created_at'
         ]
         read_only_fields = ['id', 'created_at', 'total_cost']
+
+
+class LowStockSerializer(serializers.Serializer):
+    product_id = serializers.IntegerField()
+    product_name = serializers.CharField()
+    product_sku = serializers.CharField()
+    warehouse_id = serializers.IntegerField()
+    warehouse_name = serializers.CharField()
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=2)
+    reorder_level = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+
+class BranchLowStockSerializer(serializers.Serializer):
+    product_id = serializers.IntegerField()
+    product_name = serializers.CharField()
+    product_sku = serializers.CharField()
+    branch_id = serializers.IntegerField()
+    branch_name = serializers.CharField()
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=2)
+    reorder_level = serializers.DecimalField(max_digits=12, decimal_places=2)
 
 
 class StockTransferSerializer(serializers.ModelSerializer):

@@ -8,10 +8,14 @@ urlpatterns = [
     
     # Warehouse stock endpoints
     path('entries/', views.StockEntryListView.as_view(), name='stock-entry-list'),
+    path('entries/<int:pk>/', views.StockEntryDetailView.as_view(), name='stock-entry-detail'),
     path('entries/bulk/', views.BulkAddStockView.as_view(), name='stock-entry-bulk-add'),
+    path('entries/increment/', views.IncrementStockEntryView.as_view(), name='stock-entry-increment'),
     path('adjustments/', views.StockAdjustmentListView.as_view(), name='stock-adjustment-list'),
     path('summary/', views.StockSummaryView.as_view(), name='stock-summary'),
     path('value/', views.StockValueView.as_view(), name='stock-value'),
+    path('low-stock/', views.LowStockView.as_view(), name='stock-low-stock'),
+    path('branch-low-stock/', views.BranchLowStockView.as_view(), name='branch-low-stock'),
     
     # Branch stock endpoints
     path('branch-stock/', views.BranchStockListView.as_view(), name='branch-stock-list'),

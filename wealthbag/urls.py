@@ -9,6 +9,10 @@ urlpatterns = [
     path('api/organization/', include('organization.urls')),
     path('api/products/', include('products.urls')),
     path('api/stock/', include('stock.urls')),
+    path('api/sales/', include('sales.urls')),
+    path('api/shared/', include('shared.urls')),
+    path('api/accounting/', include('accounting.urls')),
+    path('api/analytics/', include('analytics.urls')),
 ]
 
 # Serve static and media files in development

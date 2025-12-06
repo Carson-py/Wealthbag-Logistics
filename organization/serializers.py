@@ -13,9 +13,9 @@ class WarehouseSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 class BranchSerializer(serializers.ModelSerializer):
-    warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
+    warehouse_name = serializers.CharField(source='warehouse.name', read_only=True, allow_null=True)
 
     class Meta:
         model = Branch
-        fields = ['id', 'name', 'warehouse', 'warehouse_name', 'address']
-        read_only_fields = ['id']
+        fields = ['id', 'name', 'warehouse', 'warehouse_name', 'address', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']

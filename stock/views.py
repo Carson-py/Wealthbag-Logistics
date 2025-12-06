@@ -11,8 +11,10 @@ from .serializers import (
     SupplierSerializer,
     StockEntrySerializer, StockEntryGroupSerializer, StockAdjustmentSerializer,
     AddStockSerializer, RemoveStockSerializer, BulkAddStockSerializer,
+    IncrementStockEntrySerializer,
     BranchStockSerializer, AddBranchStockSerializer, RemoveBranchStockSerializer,
-    StockTransferSerializer, CreateStockTransferSerializer, BulkCreateStockTransferSerializer
+    StockTransferSerializer, CreateStockTransferSerializer, BulkCreateStockTransferSerializer,
+    LowStockSerializer, BranchLowStockSerializer
 )
 from .models import Supplier, StockEntry, StockAdjustment, BranchStock, StockTransfer
 from . import services
@@ -168,8 +170,21 @@ class StockEntryListView(APIView):
         """List all stock entries"""
         warehouse_id = request.query_params.get('warehouse_id')
         product_id = request.query_params.get('product_id')
-        
+
         entries = StockEntry.objects.all()
+        if request.user.role == 'warehouse_manager':
+            profile = getattr(request.user, 'profile', None)
+            warehouse = None
+            if profile:
+                # profile is a RelatedManager because Employee uses FK with related_name='profile'
+                employee = profile.first()
+                if employee:
+                    warehouse = employee.warehouse
+            if warehouse:
+                entries = entries.filter(warehouse=warehouse)
+            else:
+                entries = entries.none()
+
         
         if warehouse_id:
             entries = entries.filter(warehouse_id=warehouse_id)
@@ -238,6 +253,79 @@ class StockEntryListView(APIView):
                 return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+class StockEntryDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+    
+    @swagger_auto_schema(
+        request_body=StockEntrySerializer,
+        responses={200: StockEntrySerializer}
+    )
+    def patch(self, request, pk):
+        """Update stock entry (creates correction adjustment when quantity changes)"""
+        try:
+            stock_entry = StockEntry.objects.get(pk=pk)
+            data = request.data.copy()
+            adjustment_reason = data.pop('adjustment_reason', None)
+            if isinstance(adjustment_reason, list):
+                adjustment_reason = adjustment_reason[0]
+            
+            original_quantity = stock_entry.quantity
+            
+            # Check if quantity is being changed
+            new_quantity = data.get('quantity')
+            if new_quantity is not None:
+                try:
+                    new_quantity = Decimal(str(new_quantity))
+                    quantity_diff = new_quantity - original_quantity
+                    
+                    # If quantity changes, use correct_stock_entry service
+                    if quantity_diff != 0:
+                        updated_entry, adjustment = services.correct_stock_entry(
+                            stock_entry_id=pk,
+                            new_quantity=new_quantity,
+                            reason=adjustment_reason or 'Stock entry quantity corrected via edit',
+                            created_by=request.user
+                        )
+                        
+                        # Update other fields if provided (except quantity which is already updated)
+                        data.pop('quantity', None)
+                        if data:
+                            serializer = StockEntrySerializer(updated_entry, data=data, partial=True)
+                            if serializer.is_valid():
+                                updated_entry = serializer.save()
+                            else:
+                                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+                        
+                        if adjustment:
+                            log_activity(
+                                activity_type=ActivityType.STOCK_ADJUSTED,
+                                user=request.user,
+                                description=f"Corrected stock entry {updated_entry.id}: {original_quantity} -> {new_quantity} units",
+                                request=request,
+                                related_object=adjustment,
+                                metadata={
+                                    'stock_entry_id': updated_entry.id,
+                                    'old_quantity': str(original_quantity),
+                                    'new_quantity': str(new_quantity),
+                                    'adjustment_type': adjustment.adjustment_type
+                                }
+                            )
+                        
+                        return Response(StockEntrySerializer(updated_entry).data)
+                    else:
+                        # Quantity unchanged, just update other fields
+                        data.pop('quantity', None)
+                except (ValueError, TypeError):
+                    return Response({'quantity': 'Invalid quantity value'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # No quantity change, just update other fields
+            serializer = StockEntrySerializer(stock_entry, data=data, partial=True)
+            if serializer.is_valid():
+                updated_entry = serializer.save()
+                return Response(StockEntrySerializer(updated_entry).data)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        except StockEntry.DoesNotExist:
+            return Response({'detail': 'Stock entry not found.'}, status=status.HTTP_404_NOT_FOUND)
 
 class BulkAddStockView(APIView):
     permission_classes = [IsAuthenticated]
@@ -299,6 +387,41 @@ class BulkAddStockView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+class IncrementStockEntryView(APIView):
+    permission_classes = [IsAuthenticated]
+    
+    @swagger_auto_schema(
+        request_body=IncrementStockEntrySerializer,
+        responses={200: StockEntrySerializer}
+    )
+    def post(self, request):
+        """Increment stock entry quantity and create an addition adjustment"""
+        serializer = IncrementStockEntrySerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                stock_entry = services.increment_stock_entry(
+                    stock_entry_id=serializer.validated_data['stock_entry_id'],
+                    quantity=serializer.validated_data['quantity'],
+                    reason=serializer.validated_data.get('reason', ''),
+                    created_by=request.user
+                )
+                
+                log_activity(
+                    activity_type=ActivityType.STOCK_ADDED,
+                    user=request.user,
+                    description=f"Incremented stock entry {stock_entry.id}: added {serializer.validated_data['quantity']} units of {stock_entry.product.name} to {stock_entry.warehouse.name}",
+                    request=request,
+                    related_object=stock_entry,
+                )
+                
+                return Response(StockEntrySerializer(stock_entry).data, status=status.HTTP_200_OK)
+            except StockEntry.DoesNotExist:
+                return Response({'detail': 'Stock entry not found.'}, status=status.HTTP_404_NOT_FOUND)
+            except Exception as e:
+                return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
 class StockAdjustmentListView(APIView):
     permission_classes = [IsAuthenticated]
     
@@ -317,7 +440,30 @@ class StockAdjustmentListView(APIView):
         adjustment_type = request.query_params.get('adjustment_type')
         
         adjustments = StockAdjustment.objects.all()
-        
+
+        if request.user.role == 'warehouse_manager':
+            profile = getattr(request.user, 'profile', None)
+            warehouse = None
+            if profile:
+                employee = profile.first()
+                if employee:
+                    warehouse = employee.warehouse
+            if warehouse:
+                adjustments = adjustments.filter(warehouse=warehouse)
+            else:
+                adjustments = adjustments.none()
+                
+        elif request.user.role == 'branch_manager':
+            profile = getattr(request.user, 'profile', None)
+            branch = None
+            if profile:
+                employee = profile.first()
+                if employee:
+                    branch = employee.branch
+            if branch:
+                adjustments = adjustments.filter(branch=branch)
+            else:
+                adjustments = adjustments.none()
         if warehouse_id:
             adjustments = adjustments.filter(warehouse_id=warehouse_id)
         if product_id:
@@ -444,7 +590,19 @@ class BranchStockListView(APIView):
         product_id = request.query_params.get('product_id')
         
         entries = BranchStock.objects.all()
-        
+
+        if request.user.role == 'branch_manager' or request.user.role == 'cashier':
+            profile = getattr(request.user, 'profile', None)
+            branch = None
+            if profile:
+                employee = profile.first()
+                if employee:
+                    branch = employee.branch
+            if branch:
+                entries = entries.filter(branch=branch)
+            else:
+                entries = entries.none()
+
         if branch_id:
             entries = entries.filter(branch_id=branch_id)
         if product_id:
@@ -469,6 +627,65 @@ class BranchStockListView(APIView):
             status=status.HTTP_403_FORBIDDEN
         )
 
+
+class LowStockView(APIView):
+    permission_classes = [IsAuthenticated]
+    
+    @swagger_auto_schema(
+        responses={200: 'Low stock products'}
+    )
+    def get(self, request):
+        """Get low stock products"""
+        low_stock_products = services.get_low_stock_products()
+
+        user_role = getattr(request.user, 'role', None)
+        if user_role == 'warehouse_manager':
+            profile = getattr(request.user, 'profile', None)
+            warehouse = None
+            if profile:
+                employee = profile.first()
+                if employee:
+                    warehouse = employee.warehouse
+            if warehouse:
+                low_stock_products = [
+                    item for item in low_stock_products
+                    if item.get('warehouse_id') == warehouse.id
+                ]
+            else:
+                low_stock_products = []
+
+        serializer = LowStockSerializer(low_stock_products, many=True)
+        return Response(serializer.data)
+
+
+class BranchLowStockView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @swagger_auto_schema(
+        responses={200: 'Low stock branch products'}
+    )
+    def get(self, request):
+        """Get low stock products for branches"""
+        low_stock_products = services.get_low_branch_stock_products()
+
+        user_role = getattr(request.user, 'role', None)
+        if user_role in ['branch_manager', 'cashier']:
+            profile = getattr(request.user, 'profile', None)
+            branch = None
+            if profile:
+                employee = profile.first()
+                if employee:
+                    branch = employee.branch
+            if branch:
+                low_stock_products = [
+                    item for item in low_stock_products
+                    if item.get('branch_id') == branch.id
+                ]
+            else:
+                low_stock_products = []
+
+        serializer = BranchLowStockSerializer(low_stock_products, many=True)
+        return Response(serializer.data)
 
 class RemoveBranchStockView(APIView):
     permission_classes = [IsAuthenticated]
@@ -593,7 +810,37 @@ class StockTransferListView(APIView):
         destination_branch_id = request.query_params.get('destination_branch_id')
         
         transfers = StockTransfer.objects.all()
-        
+
+        # Role-based scoping
+        user_role = getattr(request.user, 'role', None)
+        profile = getattr(request.user, 'profile', None)
+
+        if user_role == 'warehouse_manager':
+            warehouse = None
+            if profile:
+                employee = profile.first()
+                if employee:
+                    warehouse = employee.warehouse
+            if warehouse:
+                transfers = transfers.filter(
+                    Q(source_warehouse=warehouse) | Q(destination_warehouse=warehouse)
+                )
+            else:
+                transfers = transfers.none()
+
+        elif user_role == 'branch_manager':
+            branch = None
+            if profile:
+                employee = profile.first()
+                if employee:
+                    branch = employee.branch
+            if branch:
+                transfers = transfers.filter(
+                    Q(source_branch=branch) | Q(destination_branch=branch)
+                )
+            else:
+                transfers = transfers.none()
+
         if transfer_type:
             transfers = transfers.filter(transfer_type=transfer_type)
         if status_filter:
@@ -617,10 +864,27 @@ class StockTransferListView(APIView):
         responses={201: StockTransferSerializer}
     )
     def post(self, request):
-        """Create a new stock transfer (supports both single and multi-product)"""
+        """Create a new stock transfer (supports both single and multi-product)
+        
+        For branch managers: If destination_branch_id is not provided, it will automatically
+        use the branch manager's branch. When the transfer is completed, if stock with the same
+        purchase price and selling price exists in the branch, it will be incremented instead
+        of creating a new entry.
+        """
         serializer = CreateStockTransferSerializer(data=request.data)
         if serializer.is_valid():
             try:
+                # Auto-fill destination_branch_id for branch managers if not provided
+                destination_branch_id = serializer.validated_data.get('destination_branch_id')
+                if not destination_branch_id and request.user.role == 'branch_manager':
+                    profile = getattr(request.user, 'profile', None)
+                    if profile:
+                        employee = profile.first()
+                        if employee and employee.branch:
+                            destination_branch_id = employee.branch.id
+                            # Update the validated_data with the branch ID
+                            serializer.validated_data['destination_branch_id'] = destination_branch_id
+                
                 items = serializer.validated_data.get('items', [])
                 
                 # Check if this is a multi-product transfer
@@ -632,7 +896,7 @@ class StockTransferListView(APIView):
                         source_warehouse_id=serializer.validated_data.get('source_warehouse_id'),
                         source_branch_id=serializer.validated_data.get('source_branch_id'),
                         destination_warehouse_id=serializer.validated_data.get('destination_warehouse_id'),
-                        destination_branch_id=serializer.validated_data.get('destination_branch_id'),
+                        destination_branch_id=destination_branch_id,
                         reference_number=serializer.validated_data.get('reference_number') or None,
                         notes=serializer.validated_data.get('notes', ''),
                         created_by=request.user
@@ -656,7 +920,7 @@ class StockTransferListView(APIView):
                         source_warehouse_id=serializer.validated_data.get('source_warehouse_id'),
                         source_branch_id=serializer.validated_data.get('source_branch_id'),
                         destination_warehouse_id=serializer.validated_data.get('destination_warehouse_id'),
-                        destination_branch_id=serializer.validated_data.get('destination_branch_id'),
+                        destination_branch_id=destination_branch_id,
                         supplier_id=serializer.validated_data.get('supplier_id'),
                         batch_number=serializer.validated_data.get('batch_number') or None,
                         reference_number=serializer.validated_data.get('reference_number') or None,

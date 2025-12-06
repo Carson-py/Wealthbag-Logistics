@@ -107,7 +107,7 @@ class CreateUserView(APIView):
         }, status=status.HTTP_201_CREATED)
 
 class UserListView(APIView):
-    permission_classes = [IsAuthenticated, IsAdminOrOwner]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
         role = request.query_params.get("role")  # optional
@@ -115,7 +115,19 @@ class UserListView(APIView):
         users = services.get_all_users(role)
         serializer = EmployeeSerializer(users, many=True)
         return Response(serializer.data)
-        
+
+
+class ProfileView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @swagger_auto_schema(
+        responses={200: EmployeeSerializer}
+    )
+    def get(self, request):
+        employee = request.user.profile.first()
+        serializer = EmployeeSerializer(employee)
+        return Response(serializer.data)
+
 
 class BlockUnblockAccountView(APIView):
     permission_classes = [IsAuthenticated, IsAdminOrOwner]
@@ -212,38 +224,41 @@ class ResetPasswordView(APIView):
         responses={200: 'Password reset successfully'}
     )
     def post(self, request):
-        """Reset a user's password (admin/owner only)."""
+        """Reset a user's password. User submits their email and receives a new password via email."""
         serializer = ResetPasswordSerializer(data=request.data)
         if serializer.is_valid():
             try:
                 email = serializer.validated_data.get('email')
-                user_id = serializer.validated_data.get('user_id')
                 
                 user, new_password = services.reset_password(
-                    email=email,
-                    user_id=user_id
+                    email=email
                 )
                 
-                # Log password reset
+                # Log password reset (handle anonymous users for self-service reset)
+                reset_by = request.user if request.user.is_authenticated else None
+                reset_by_email = request.user.email if request.user.is_authenticated else 'self-service'
+                
                 log_activity(
                     activity_type=ActivityType.PASSWORD_RESET,
-                    user=request.user,
-                    description=f"Password reset for user: {user.email} by {request.user.email}",
+                    user=reset_by,
+                    description=f"Password reset for user: {user.email} (self-service)",
                     request=request,
                     related_object=user,
                     metadata={
                         'target_user_email': user.email,
-                        'reset_by': request.user.email,
+                        'reset_by': reset_by_email,
+                        'reset_type': 'self-service',
                     }
                 )
                 
                 return Response({
-                    'message': 'Password reset successfully. New password has been sent to the user via email.',
-                    'user': UserSerializer(user).data,
-                    'new_password': new_password  # Only returned to admin for reference
-                })
+                    'message': 'Password reset successfully. A new password has been sent to your email address.',
+                }, status=status.HTTP_200_OK)
             except User.DoesNotExist:
-                return Response({'detail': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+                # Don't reveal if user exists or not for security reasons
+                return Response({
+                    'message': 'If an account with that email exists, a password reset email has been sent.'
+                }, status=status.HTTP_200_OK)
             except ValueError as e:
                 return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
