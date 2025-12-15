@@ -14,9 +14,11 @@ from .serializers import (
     IncrementStockEntrySerializer,
     BranchStockSerializer, AddBranchStockSerializer, RemoveBranchStockSerializer,
     StockTransferSerializer, CreateStockTransferSerializer, BulkCreateStockTransferSerializer,
-    LowStockSerializer, BranchLowStockSerializer
+    LowStockSerializer, BranchLowStockSerializer, ImportStockFromExcelSerializer,
+    ImportProductsFromExcelSerializer, ImportStockTransfersFromExcelSerializer
 )
 from .models import Supplier, StockEntry, StockAdjustment, BranchStock, StockTransfer
+from organization.models import Warehouse
 from . import services
 from shared.audit import log_activity, ActivityType
 from accounts.permissions import IsAdminOrOwner
@@ -270,6 +272,8 @@ class StockEntryDetailView(APIView):
                 adjustment_reason = adjustment_reason[0]
             
             original_quantity = stock_entry.quantity
+            original_purchase_price = stock_entry.purchase_price
+            original_selling_price = stock_entry.selling_price
             
             # Check if quantity is being changed
             new_quantity = data.get('quantity')
@@ -295,6 +299,32 @@ class StockEntryDetailView(APIView):
                                 updated_entry = serializer.save()
                             else:
                                 return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+                        
+                        # Log price changes if they occurred
+                        price_changed = False
+                        changes = []
+                        if updated_entry.purchase_price != original_purchase_price:
+                            changes.append(f"Purchase price: ${original_purchase_price} -> ${updated_entry.purchase_price}")
+                            price_changed = True
+                        if updated_entry.selling_price != original_selling_price:
+                            changes.append(f"Selling price: ${original_selling_price} -> ${updated_entry.selling_price}")
+                            price_changed = True
+                        
+                        if price_changed:
+                            log_activity(
+                                activity_type=ActivityType.STOCK_ADJUSTED,
+                                user=request.user,
+                                description=f"Updated stock entry {updated_entry.id} prices: {', '.join(changes)}",
+                                request=request,
+                                related_object=updated_entry,
+                                metadata={
+                                    'stock_entry_id': updated_entry.id,
+                                    'old_purchase_price': str(original_purchase_price),
+                                    'new_purchase_price': str(updated_entry.purchase_price),
+                                    'old_selling_price': str(original_selling_price),
+                                    'new_selling_price': str(updated_entry.selling_price),
+                                }
+                            )
                         
                         if adjustment:
                             log_activity(
@@ -322,6 +352,180 @@ class StockEntryDetailView(APIView):
             serializer = StockEntrySerializer(stock_entry, data=data, partial=True)
             if serializer.is_valid():
                 updated_entry = serializer.save()
+                
+                # Log price changes if they occurred
+                price_changed = False
+                changes = []
+                if updated_entry.purchase_price != original_purchase_price:
+                    changes.append(f"Purchase price: ${original_purchase_price} -> ${updated_entry.purchase_price}")
+                    price_changed = True
+                if updated_entry.selling_price != original_selling_price:
+                    changes.append(f"Selling price: ${original_selling_price} -> ${updated_entry.selling_price}")
+                    price_changed = True
+                
+                if price_changed:
+                    log_activity(
+                        activity_type=ActivityType.STOCK_ADJUSTED,
+                        user=request.user,
+                        description=f"Updated stock entry {updated_entry.id} prices: {', '.join(changes)}",
+                        request=request,
+                        related_object=updated_entry,
+                        metadata={
+                            'stock_entry_id': updated_entry.id,
+                            'old_purchase_price': str(original_purchase_price),
+                            'new_purchase_price': str(updated_entry.purchase_price),
+                            'old_selling_price': str(original_selling_price),
+                            'new_selling_price': str(updated_entry.selling_price),
+                        }
+                    )
+                
+                return Response(StockEntrySerializer(updated_entry).data)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        except StockEntry.DoesNotExist:
+            return Response({'detail': 'Stock entry not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    @swagger_auto_schema(
+        request_body=StockEntrySerializer,
+        responses={200: StockEntrySerializer}
+    )
+    def put(self, request, pk):
+        """Update stock entry (full update) - allows editing prices and other fields"""
+        try:
+            stock_entry = StockEntry.objects.get(pk=pk)
+            data = request.data.copy()
+            adjustment_reason = data.pop('adjustment_reason', None)
+            if isinstance(adjustment_reason, list):
+                adjustment_reason = adjustment_reason[0]
+            
+            # Store original values for logging
+            original_quantity = stock_entry.quantity
+            original_purchase_price = stock_entry.purchase_price
+            original_selling_price = stock_entry.selling_price
+            
+            # Get new values
+            new_quantity = data.get('quantity')
+            new_purchase_price = data.get('purchase_price')
+            new_selling_price = data.get('selling_price')
+            
+            # Validate quantity if provided
+            if new_quantity is not None:
+                try:
+                    new_quantity = Decimal(str(new_quantity))
+                except (ValueError, TypeError):
+                    return Response({'quantity': 'Invalid quantity value'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Validate prices if provided
+            if new_purchase_price is not None:
+                try:
+                    new_purchase_price = Decimal(str(new_purchase_price))
+                    if new_purchase_price < 0:
+                        return Response({'purchase_price': 'Purchase price cannot be negative'}, status=status.HTTP_400_BAD_REQUEST)
+                except (ValueError, TypeError):
+                    return Response({'purchase_price': 'Invalid purchase price value'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            if new_selling_price is not None:
+                try:
+                    new_selling_price = Decimal(str(new_selling_price))
+                    if new_selling_price < 0:
+                        return Response({'selling_price': 'Selling price cannot be negative'}, status=status.HTTP_400_BAD_REQUEST)
+                except (ValueError, TypeError):
+                    return Response({'selling_price': 'Invalid selling price value'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Handle quantity changes using the correction service
+            quantity_changed = False
+            if new_quantity is not None and new_quantity != original_quantity:
+                quantity_diff = new_quantity - original_quantity
+                if quantity_diff != 0:
+                    updated_entry, adjustment = services.correct_stock_entry(
+                        stock_entry_id=pk,
+                        new_quantity=new_quantity,
+                        reason=adjustment_reason or 'Stock entry quantity updated via PUT',
+                        created_by=request.user
+                    )
+                    stock_entry = updated_entry  # Use the updated entry
+                    quantity_changed = True
+            
+            # Track price changes
+            price_changed = False
+            if new_purchase_price is not None and new_purchase_price != original_purchase_price:
+                price_changed = True
+            if new_selling_price is not None and new_selling_price != original_selling_price:
+                price_changed = True
+            
+            # Ensure prices are in data if they were provided
+            if new_purchase_price is not None:
+                data['purchase_price'] = new_purchase_price
+            if new_selling_price is not None:
+                data['selling_price'] = new_selling_price
+            
+            # Use serializer for all fields
+            serializer = StockEntrySerializer(stock_entry, data=data, partial=True)
+            if serializer.is_valid():
+                updated_entry = serializer.save()
+                
+                # Log price changes if they occurred
+                if price_changed:
+                    changes = []
+                    if updated_entry.purchase_price != original_purchase_price:
+                        changes.append(f"Purchase price: ${original_purchase_price} -> ${updated_entry.purchase_price}")
+                    if updated_entry.selling_price != original_selling_price:
+                        changes.append(f"Selling price: ${original_selling_price} -> ${updated_entry.selling_price}")
+                    
+                    if changes:  # Only log if there are actual changes
+                        log_activity(
+                            activity_type=ActivityType.STOCK_ADJUSTED,
+                            user=request.user,
+                            description=f"Updated stock entry {updated_entry.id} prices: {', '.join(changes)}",
+                            request=request,
+                            related_object=updated_entry,
+                            metadata={
+                                'stock_entry_id': updated_entry.id,
+                                'old_purchase_price': str(original_purchase_price),
+                                'new_purchase_price': str(updated_entry.purchase_price),
+                                'old_selling_price': str(original_selling_price),
+                                'new_selling_price': str(updated_entry.selling_price),
+                            }
+                        )
+                    
+                    # Update corresponding branch stock prices
+                    branch_stocks = BranchStock.objects.filter(original_stock_entry=updated_entry)
+                    updated_branch_count = 0
+                    for branch_stock in branch_stocks:
+                        branch_stock.purchase_price = updated_entry.purchase_price
+                        branch_stock.selling_price = updated_entry.selling_price
+                        branch_stock.save(update_fields=['purchase_price', 'selling_price'])
+                        updated_branch_count += 1
+                    
+                    if updated_branch_count > 0:
+                        log_activity(
+                            activity_type=ActivityType.STOCK_ADJUSTED,
+                            user=request.user,
+                            description=f"Updated prices for {updated_branch_count} branch stock entry/entries linked to stock entry {updated_entry.id}",
+                            request=request,
+                            related_object=updated_entry,
+                            metadata={
+                                'stock_entry_id': updated_entry.id,
+                                'updated_branch_stock_count': updated_branch_count,
+                                'new_purchase_price': str(updated_entry.purchase_price),
+                                'new_selling_price': str(updated_entry.selling_price),
+                            }
+                        )
+                
+                # Log quantity change if it occurred (already logged by correct_stock_entry, but we can add context)
+                if quantity_changed:
+                    log_activity(
+                        activity_type=ActivityType.STOCK_ADJUSTED,
+                        user=request.user,
+                        description=f"Updated stock entry {updated_entry.id}: quantity {original_quantity} -> {new_quantity} units",
+                        request=request,
+                        related_object=updated_entry,
+                        metadata={
+                            'stock_entry_id': updated_entry.id,
+                            'old_quantity': str(original_quantity),
+                            'new_quantity': str(new_quantity),
+                        }
+                    )
+                
                 return Response(StockEntrySerializer(updated_entry).data)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         except StockEntry.DoesNotExist:
@@ -384,6 +588,78 @@ class BulkAddStockView(APIView):
                     'failed': len(errors)
                 }
             }, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ImportStockFromExcelView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @swagger_auto_schema(
+        request_body=ImportStockFromExcelSerializer,
+        responses={201: openapi.Response(description='Stock imported')}
+    )
+    def post(self, request):
+        """Import stock into a warehouse from an Excel file."""
+        serializer = ImportStockFromExcelSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                # Always use main warehouse regardless of provided warehouse_id
+                # Resolve warehouse: prefer main; fallback to first available
+                try:
+                    main_warehouse = services.get_main_warehouse()
+                except Exception:
+                    main_warehouse = Warehouse.objects.first()
+                    if not main_warehouse:
+                        return Response({'detail': 'No warehouse found. Please create a warehouse first.'}, status=status.HTTP_400_BAD_REQUEST)
+
+                result = services.import_stock_from_excel(
+                    file_obj=serializer.validated_data['file'],
+                    warehouse_id=main_warehouse.id,
+                    notes=serializer.validated_data.get('notes', ''),
+                    created_by=request.user
+                )
+
+                log_activity(
+                    activity_type=ActivityType.STOCK_ADDED,
+                    user=request.user,
+                    description=f"Imported stock from Excel: {result['summary']['successful']} succeeded, {result['summary']['failed']} failed",
+                    request=request,
+                )
+
+                return Response(result, status=status.HTTP_201_CREATED)
+            except ValueError as exc:
+                return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ImportProductsFromExcelView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @swagger_auto_schema(
+        request_body=ImportProductsFromExcelSerializer,
+        responses={201: openapi.Response(description='Products imported')}
+    )
+    def post(self, request):
+        """Import products (and suppliers) from an Excel file."""
+        serializer = ImportProductsFromExcelSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                result = services.import_products_from_excel(
+                    file_obj=serializer.validated_data['file'],
+                    notes=serializer.validated_data.get('notes', ''),
+                    created_by=request.user
+                )
+
+                log_activity(
+                    activity_type=ActivityType.CUSTOM,
+                    user=request.user,
+                    description=f"Imported products from Excel: {result['summary']['successful']} succeeded, {result['summary']['failed']} failed",
+                    request=request,
+                )
+
+                return Response(result, status=status.HTTP_201_CREATED)
+            except ValueError as exc:
+                return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -999,6 +1275,55 @@ class BulkCreateStockTransferView(APIView):
                     'failed': len(errors)
                 }
             }, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ImportStockTransfersFromExcelView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @swagger_auto_schema(
+        request_body=ImportStockTransfersFromExcelSerializer,
+        responses={201: openapi.Response(description='Stock transfers imported')}
+    )
+    def post(self, request):
+        """Import stock transfers from an Excel file.
+        
+        transfer_type, source_warehouse_id/source_branch_id, and destination_warehouse_id/destination_branch_id
+        must be provided as form parameters. You can provide either IDs (integers) or names (strings) for warehouses and branches.
+        
+        Excel file should only contain product information:
+        - product_name: Product name (required)
+        - description: Product description (optional, recommended if multiple products share the same name)
+        - quantity: Quantity to transfer (required)
+        - selling_price: Selling price (optional, auto-filled for branch transfers)
+        - reorder_level: Reorder level (optional)
+        - item_notes: Notes for individual item (optional)
+        """
+        serializer = ImportStockTransfersFromExcelSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                result = services.import_stock_transfers_from_excel(
+                    file_obj=serializer.validated_data['file'],
+                    transfer_type=serializer.validated_data['transfer_type'],
+                    source_warehouse_id=serializer.validated_data.get('source_warehouse_id'),
+                    source_branch_id=serializer.validated_data.get('source_branch_id'),
+                    destination_warehouse_id=serializer.validated_data.get('destination_warehouse_id'),
+                    destination_branch_id=serializer.validated_data.get('destination_branch_id'),
+                    reference_number=serializer.validated_data.get('reference_number') or None,
+                    notes=serializer.validated_data.get('notes', ''),
+                    created_by=request.user
+                )
+
+                log_activity(
+                    activity_type=ActivityType.CUSTOM,
+                    user=request.user,
+                    description=f"Imported stock transfers from Excel: {result['summary']['successful']} succeeded, {result['summary']['failed']} failed",
+                    request=request,
+                )
+
+                return Response(result, status=status.HTTP_201_CREATED)
+            except ValueError as exc:
+                return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 

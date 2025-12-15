@@ -54,7 +54,6 @@ class User(AbstractBaseUser, PermissionsMixin):
         ('branch_manager', 'Branch Manager'),
         ('warehouse_manager', 'Warehouse Manager'),
         ('cashier', 'Cashier')
-
     ]
 
     ACCOUNT_STATUS = [
@@ -64,7 +63,7 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     email = models.EmailField(unique=True, verbose_name='Email Address')
     first_login = models.BooleanField(default=True, verbose_name='First Login')
-    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='cashier', verbose_name='Role')
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='owner', verbose_name='Role')
     is_active = models.BooleanField(default=True, verbose_name='Active')
     account_status = models.CharField(max_length=20, choices=ACCOUNT_STATUS, default='active')
     is_staff = models.BooleanField(default=False, verbose_name='Staff Status')

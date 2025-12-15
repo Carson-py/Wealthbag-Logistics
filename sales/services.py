@@ -33,7 +33,16 @@ from analytics import services as analytics_services
 from accounting import services as accounting_services
 
 from django.db.models.functions import TruncDate, TruncMonth
-from .models import Sale, SaleItem, ProductReturn, DailySalesReport, Discount, ReturnAuthorizationCode, CashReceived
+from .models import (
+    Sale,
+    SaleItem,
+    ProductReturn,
+    DailySalesReport,
+    Discount,
+    ReturnAuthorizationCode,
+    CashReceived,
+    ExchangeRate,
+)
 
 
 def _make_json_serializable(obj):
@@ -997,7 +1006,12 @@ def _recalculate_sale_totals(sale: Sale):
     This sums all item subtotals (which already have item-level discounts deducted).
     Sale-level discounts are stored separately in sale.discount.
     """
-    total = sale.items.aggregate(total=Sum('subtotal'))['total'] or Decimal('0')
+    # Recalculate from unit_price, quantity and item discount to be robust even
+    # if the stored subtotal field is out of sync for any reason.
+    total = Decimal('0')
+    for item in sale.items.all():
+        total += (item.unit_price * item.quantity) - (item.discount or Decimal('0'))
+
     sale.total_amount = total
     sale.save(update_fields=['total_amount', 'updated_at'])
 
@@ -1022,8 +1036,9 @@ def get_receipt_calculation(sale: Sale) -> Dict:
     
     for item in sale.items.all():
         item_total_before_discount = item.unit_price * item.quantity
-        item_discount = item.discount
-        item_subtotal = item.subtotal
+        item_discount = item.discount or Decimal('0')
+        # Derive subtotal from price/qty/discount to avoid relying on a stale field
+        item_subtotal = item_total_before_discount - item_discount
         
         items_subtotal_before_discount += item_total_before_discount
         items_total_discount += item_discount
@@ -1096,14 +1111,16 @@ def _apply_discount_to_created_sale(sale: Sale, discount: Discount) -> Decimal:
         for item in sale.items.filter(product=discount.product):
             item_discount = discount.calculate_discount(item.unit_price, item.quantity)
             item.discount = item.discount + item_discount
-            item.save(update_fields=['discount'])
+            # Save without update_fields to trigger SaleItem.save() which recalculates subtotal
+            item.save()
             total_discount += item_discount
     elif discount.apply_to == 'category' and discount.category:
         # Apply to category items
         for item in sale.items.filter(product__category=discount.category):
             item_discount = discount.calculate_discount(item.unit_price, item.quantity)
             item.discount = item.discount + item_discount
-            item.save(update_fields=['discount'])
+            # Save without update_fields to trigger SaleItem.save() which recalculates subtotal
+            item.save()
             total_discount += item_discount
     else:
         # Apply to entire sale (all, branch, min_purchase)
@@ -1236,15 +1253,65 @@ def create_sale(
 
         # Apply discount after items are created (so we have actual prices)
         if discount:
+            # Manually selected discount (code / id passed from client)
             _apply_discount_to_created_sale(sale, discount)
-            # Recalculate totals after applying discount
             _recalculate_sale_totals(sale)
-            # Increment discount usage
             discount.increment_usage()
-            # Store discount info for response
             sale._discount_info = discount_info
         else:
-            sale._discount_info = None
+            # No explicit discount passed – auto-apply product-linked discounts
+            # so that net amount reflects product discounts configured in the system.
+            product_ids = list(
+                sale.items.values_list('product_id', flat=True).distinct()
+            )
+            auto_discounts_info: List[Dict] = []
+
+            if product_ids:
+                now = timezone.now()
+                # Active product-level discounts for products in this sale,
+                # valid for this branch or global (no branch set).
+                auto_discounts = Discount.objects.filter(
+                    is_active=True,
+                    apply_to='product',
+                    product_id__in=product_ids,
+                ).filter(
+                    Q(branch_id=branch_id) | Q(branch__isnull=True)
+                ).filter(
+                    Q(start_date__isnull=True) | Q(start_date__lte=now),
+                    Q(end_date__isnull=True) | Q(end_date__gte=now),
+                    Q(usage_limit__isnull=True) | Q(usage_count__lt=F('usage_limit')),
+                )
+
+                total_auto_discount = Decimal('0')
+                for d in auto_discounts:
+                    discount_amount = _apply_discount_to_created_sale(sale, d)
+                    if discount_amount > 0:
+                        # Increment usage once per discount applied on this sale
+                        d.increment_usage()
+                        total_auto_discount += discount_amount
+                        auto_discounts_info.append(
+                            {
+                                'discount_id': d.id,
+                                'discount_code': d.code,
+                                'discount_name': d.name,
+                                'auto_applied': True,
+                                'manually_selected': False,
+                                'amount': discount_amount,
+                            }
+                        )
+
+                if auto_discounts_info:
+                    # Update Sale.discount to reflect total of all item-level discounts
+                    sale.discount = total_auto_discount
+                    sale.save(update_fields=['discount', 'updated_at'])
+                    _recalculate_sale_totals(sale)
+                    sale._discount_info = {
+                        'auto_applied': True,
+                        'manually_selected': False,
+                        'discounts': auto_discounts_info,
+                    }
+                else:
+                    sale._discount_info = None
 
     return sale
 
@@ -1923,22 +1990,34 @@ def get_monthly_sales_report_data(report_month: Optional[int] = None, report_yea
         status='completed'
     ).select_related('branch', 'cashier').prefetch_related('items__product')
     
-    # Overall summary
+    # Overall summary - convert ZIG amounts to USD
     total_sales = sales.count()
-    total_amount = sales.aggregate(total=Sum('total_amount'))['total'] or Decimal('0')
-    total_discount = sales.aggregate(total=Sum('discount'))['total'] or Decimal('0')
-    total_tax = sales.aggregate(total=Sum('tax'))['total'] or Decimal('0')
-    
-    # Calculate total cost and profit from sale items
+    total_amount = Decimal('0')
+    total_discount = Decimal('0')
+    total_tax = Decimal('0')
     total_cost = Decimal('0')
     total_profit = Decimal('0')
     total_items_sold = Decimal('0')
     
     for sale in sales:
+        payment_method = sale.type_of_payment
+        # Convert sale amounts from ZIG to USD if needed
+        sale_total = convert_zig_to_usd(sale.total_amount, payment_method)
+        sale_discount = convert_zig_to_usd(sale.discount, payment_method)
+        sale_tax = convert_zig_to_usd(sale.tax, payment_method)
+        
+        total_amount += sale_total
+        total_discount += sale_discount
+        total_tax += sale_tax
+        
         for item in sale.items.all():
+            # Convert item amounts from ZIG to USD if needed
+            item_subtotal = convert_zig_to_usd(item.subtotal, payment_method)
             item_cost = item.purchase_price * item.quantity
-            item_profit = item.subtotal - item_cost
-            total_cost += item_cost
+            item_cost_usd = convert_zig_to_usd(item_cost, payment_method)
+            item_profit = item_subtotal - item_cost_usd
+            
+            total_cost += item_cost_usd
             total_profit += item_profit
             total_items_sold += item.quantity
     
@@ -1960,19 +2039,32 @@ def get_monthly_sales_report_data(report_month: Optional[int] = None, report_yea
     for branch in branches:
         branch_sales = sales.filter(branch=branch)
         branch_total_sales = branch_sales.count()
-        branch_total_amount = branch_sales.aggregate(total=Sum('total_amount'))['total'] or Decimal('0')
-        branch_total_discount = branch_sales.aggregate(total=Sum('discount'))['total'] or Decimal('0')
-        branch_total_tax = branch_sales.aggregate(total=Sum('tax'))['total'] or Decimal('0')
-        
+        branch_total_amount = Decimal('0')
+        branch_total_discount = Decimal('0')
+        branch_total_tax = Decimal('0')
         branch_cost = Decimal('0')
         branch_profit = Decimal('0')
         branch_items_sold = Decimal('0')
         
         for sale in branch_sales:
+            payment_method = sale.type_of_payment
+            # Convert sale amounts from ZIG to USD if needed
+            sale_total = convert_zig_to_usd(sale.total_amount, payment_method)
+            sale_discount = convert_zig_to_usd(sale.discount, payment_method)
+            sale_tax = convert_zig_to_usd(sale.tax, payment_method)
+            
+            branch_total_amount += sale_total
+            branch_total_discount += sale_discount
+            branch_total_tax += sale_tax
+            
             for item in sale.items.all():
+                # Convert item amounts from ZIG to USD if needed
+                item_subtotal = convert_zig_to_usd(item.subtotal, payment_method)
                 item_cost = item.purchase_price * item.quantity
-                item_profit = item.subtotal - item_cost
-                branch_cost += item_cost
+                item_cost_usd = convert_zig_to_usd(item_cost, payment_method)
+                item_profit = item_subtotal - item_cost_usd
+                
+                branch_cost += item_cost_usd
                 branch_profit += item_profit
                 branch_items_sold += item.quantity
         
@@ -1989,12 +2081,17 @@ def get_monthly_sales_report_data(report_month: Optional[int] = None, report_yea
             'profit_margin': (branch_profit / branch_total_amount * 100) if branch_total_amount > 0 else Decimal('0'),
         })
     
-    # Payment method breakdown
+    # Payment method breakdown - convert ZIG amounts to USD
     payment_methods = {}
     for payment_type, _ in Sale.TYPE_OF_PAYMENT_CHOICES:
         method_sales = sales.filter(type_of_payment=payment_type)
         method_count = method_sales.count()
-        method_total = method_sales.aggregate(total=Sum('total_amount'))['total'] or Decimal('0')
+        method_total = Decimal('0')
+        
+        for sale in method_sales:
+            sale_total = convert_zig_to_usd(sale.total_amount, payment_type)
+            method_total += sale_total
+        
         payment_methods[payment_type] = {
             'count': method_count,
             'total': method_total,
@@ -2842,22 +2939,34 @@ def get_sales_history(
     if branch_id:
         sales_query = sales_query.filter(branch_id=branch_id)
     
-    # Overall summary
+    # Overall summary - convert ZIG amounts to USD
     total_sales = sales_query.count()
-    total_amount = sales_query.aggregate(total=Sum('total_amount'))['total'] or Decimal('0')
-    total_discount = sales_query.aggregate(total=Sum('discount'))['total'] or Decimal('0')
-    total_tax = sales_query.aggregate(total=Sum('tax'))['total'] or Decimal('0')
-    
-    # Calculate total cost and profit
+    total_amount = Decimal('0')
+    total_discount = Decimal('0')
+    total_tax = Decimal('0')
     total_cost = Decimal('0')
     total_profit = Decimal('0')
     total_items_sold = Decimal('0')
     
     for sale in sales_query:
+        payment_method = sale.type_of_payment
+        # Convert sale amounts from ZIG to USD if needed
+        sale_total = convert_zig_to_usd(sale.total_amount, payment_method)
+        sale_discount = convert_zig_to_usd(sale.discount, payment_method)
+        sale_tax = convert_zig_to_usd(sale.tax, payment_method)
+        
+        total_amount += sale_total
+        total_discount += sale_discount
+        total_tax += sale_tax
+        
         for item in sale.items.all():
+            # Convert item amounts from ZIG to USD if needed
+            item_subtotal = convert_zig_to_usd(item.subtotal, payment_method)
             item_cost = item.purchase_price * item.quantity
-            item_profit = item.subtotal - item_cost
-            total_cost += item_cost
+            item_cost_usd = convert_zig_to_usd(item_cost, payment_method)
+            item_profit = item_subtotal - item_cost_usd
+            
+            total_cost += item_cost_usd
             total_profit += item_profit
             total_items_sold += item.quantity
     
@@ -2950,25 +3059,42 @@ def get_sales_history(
             period_cost = Decimal('0')
             period_profit = Decimal('0')
             period_items = Decimal('0')
+            period_amount = Decimal('0')
+            period_discount = Decimal('0')
+            period_tax = Decimal('0')
             
             for sale in period_sales:
+                payment_method = sale.type_of_payment
+                # Convert sale amounts from ZIG to USD if needed
+                sale_total = convert_zig_to_usd(sale.total_amount, payment_method)
+                sale_discount = convert_zig_to_usd(sale.discount, payment_method)
+                sale_tax = convert_zig_to_usd(sale.tax, payment_method)
+                
+                period_amount += sale_total
+                period_discount += sale_discount
+                period_tax += sale_tax
+                
                 for item in sale.items.all():
+                    # Convert item amounts from ZIG to USD if needed
+                    item_subtotal = convert_zig_to_usd(item.subtotal, payment_method)
                     item_cost = item.purchase_price * item.quantity
-                    item_profit = item.subtotal - item_cost
-                    period_cost += item_cost
+                    item_cost_usd = convert_zig_to_usd(item_cost, payment_method)
+                    item_profit = item_subtotal - item_cost_usd
+                    
+                    period_cost += item_cost_usd
                     period_profit += item_profit
                     period_items += item.quantity
             
             breakdown.append({
                 'month': period_date.strftime('%Y-%m'),
                 'total_sales': row['total_sales'],
-                'total_amount': float(row['total_amount'] or Decimal('0')),
-                'total_discount': float(row['total_discount'] or Decimal('0')),
-                'total_tax': float(row['total_tax'] or Decimal('0')),
+                'total_amount': float(period_amount),
+                'total_discount': float(period_discount),
+                'total_tax': float(period_tax),
                 'total_cost': float(period_cost),
                 'total_profit': float(period_profit),
                 'total_items_sold': float(period_items),
-                'profit_margin': float((period_profit / row['total_amount'] * 100) if row['total_amount'] else Decimal('0')),
+                'profit_margin': float((period_profit / period_amount * 100) if period_amount > 0 else Decimal('0')),
             })
     
     return {
@@ -2995,25 +3121,42 @@ def _get_daily_breakdown_from_sales(sales_query) -> List[Dict]:
         # Get sales for this date
         date_sales = sales_query.filter(created_at__date=sale_date)
         
-        # Calculate cost and profit for this date
+        # Calculate cost and profit for this date - convert ZIG amounts to USD
         date_cost = Decimal('0')
         date_profit = Decimal('0')
         date_items = Decimal('0')
+        date_amount = Decimal('0')
+        date_discount = Decimal('0')
+        date_tax = Decimal('0')
         
         for sale in date_sales:
+            payment_method = sale.type_of_payment
+            # Convert sale amounts from ZIG to USD if needed
+            sale_total = convert_zig_to_usd(sale.total_amount, payment_method)
+            sale_discount = convert_zig_to_usd(sale.discount, payment_method)
+            sale_tax = convert_zig_to_usd(sale.tax, payment_method)
+            
+            date_amount += sale_total
+            date_discount += sale_discount
+            date_tax += sale_tax
+            
             for item in sale.items.all():
+                # Convert item amounts from ZIG to USD if needed
+                item_subtotal = convert_zig_to_usd(item.subtotal, payment_method)
                 item_cost = item.purchase_price * item.quantity
-                item_profit = item.subtotal - item_cost
-                date_cost += item_cost
+                item_cost_usd = convert_zig_to_usd(item_cost, payment_method)
+                item_profit = item_subtotal - item_cost_usd
+                
+                date_cost += item_cost_usd
                 date_profit += item_profit
                 date_items += item.quantity
         
         breakdown.append({
             'date': sale_date.isoformat(),
             'total_sales': row['total_sales'],
-            'total_amount': float(row['total_amount'] or Decimal('0')),
-            'total_discount': float(row['total_discount'] or Decimal('0')),
-            'total_tax': float(row['total_tax'] or Decimal('0')),
+            'total_amount': float(date_amount),
+            'total_discount': float(date_discount),
+            'total_tax': float(date_tax),
             'total_cost': float(date_cost),
             'total_profit': float(date_profit),
             'total_items_sold': float(date_items),
@@ -3214,14 +3357,21 @@ def apply_discount_to_sale(sale: Sale, discount_code: Optional[str] = None, disc
 
 
 def get_available_discounts(branch_id: Optional[int] = None, product_id: Optional[int] = None) -> List[Discount]:
-    """Get all available (active and valid) discounts."""
+    """
+    Get all available (active and valid) discounts.
+
+    Notes:
+    - Branch-scoped call should still return global (branch-less) discounts so
+      product/category discounts set without a branch are not filtered out.
+    - Product filter is applied after branch filtering to keep only relevant
+      product/category discounts.
+    """
     now = timezone.now()
     discounts = Discount.objects.filter(is_active=True)
     
     if branch_id:
-        discounts = discounts.filter(
-            Q(branch_id=branch_id) | Q(apply_to__in=['all', 'min_purchase'])
-        )
+        # Include discounts tied to the branch or global ones (branch=None)
+        discounts = discounts.filter(Q(branch_id=branch_id) | Q(branch__isnull=True))
     
     if product_id:
         from products.models import Product
@@ -3331,11 +3481,13 @@ def create_or_update_cash_received(
     date: date,
     total_amount: Decimal,
     entered_by: User,
+    type_of_payment: str = 'usd_cash',
     notes: str = ''
 ) -> CashReceived:
     """
     Create or update a cash received entry for a cashier on a specific date.
-    If an entry already exists for the cashier, branch, and date, it will be updated.
+    Supports multiple entries per day - one entry per payment type (USD Cash, ZIG Cash, Ecocash, Bank Transfer, etc.).
+    If an entry already exists for the cashier, branch, date, and payment type, it will be updated.
     
     Args:
         cashier_id: ID of the cashier
@@ -3343,11 +3495,16 @@ def create_or_update_cash_received(
         date: Date when cash was received
         total_amount: Total amount of cash received
         entered_by: User (manager) who is entering this record
+        type_of_payment: Type of payment/currency (default: 'usd_cash')
+                        Options: 'usd_cash', 'zig_cash', 'ecocash_usd', 'ecocash_zig', 
+                                'bank_transfer_usd', 'bank_transfer_zig'
         notes: Optional notes about the cash received
     
     Returns:
         CashReceived instance
     """
+    from django.db import IntegrityError
+    from django.core.exceptions import ValidationError
     
     cashier = User.objects.get(pk=cashier_id)
     branch = Branch.objects.get(pk=branch_id)
@@ -3359,18 +3516,51 @@ def create_or_update_cash_received(
         if employee and employee.branch != branch:
             raise ValueError('Cashier does not belong to the specified branch.')
     
-    cash_received, created = CashReceived.objects.update_or_create(
-        cashier=cashier,
-        branch=branch,
-        date=date,
-        defaults={
-            'total_amount': total_amount,
-            'entered_by': entered_by,
-            'notes': notes,
-        }
-    )
+    # Validate type_of_payment
+    valid_payment_types = [choice[0] for choice in Sale.TYPE_OF_PAYMENT_CHOICES]
+    if type_of_payment not in valid_payment_types:
+        raise ValueError(f'Invalid type_of_payment. Must be one of: {", ".join(valid_payment_types)}')
     
-    return cash_received
+    # Use get_or_create with transaction to handle unique constraint properly
+    # This prevents duplicate key errors from concurrent requests
+    try:
+        with transaction.atomic():
+            # Use get_or_create which handles the unique constraint automatically
+            # It returns (object, created) tuple where created is True if object was created
+            cash_received, created = CashReceived.objects.get_or_create(
+                cashier=cashier,
+                branch=branch,
+                date=date,
+                type_of_payment=type_of_payment,
+                defaults={
+                    'total_amount': total_amount,
+                    'entered_by': entered_by,
+                    'notes': notes,
+                }
+            )
+            
+            # If record already existed, update it with new values
+            if not created:
+                cash_received.total_amount = total_amount
+                cash_received.entered_by = entered_by
+                cash_received.notes = notes
+                cash_received.save(update_fields=['total_amount', 'entered_by', 'notes'])
+            
+            return cash_received
+    except (IntegrityError, ValidationError):
+        # Handle edge case: if get_or_create fails due to concurrent creation,
+        # fetch the existing record and update it
+        cash_received = CashReceived.objects.get(
+            cashier=cashier,
+            branch=branch,
+            date=date,
+            type_of_payment=type_of_payment
+        )
+        cash_received.total_amount = total_amount
+        cash_received.entered_by = entered_by
+        cash_received.notes = notes
+        cash_received.save(update_fields=['total_amount', 'entered_by', 'notes'])
+        return cash_received
 
 
 def calculate_cash_variance(
@@ -3380,6 +3570,7 @@ def calculate_cash_variance(
 ) -> Dict:
     """
     Calculate variance between total sales and cash received for a cashier.
+    Supports multiple cash received entries per day (one per payment type).
     
     Args:
         cashier_id: Optional cashier ID to filter by
@@ -3394,12 +3585,18 @@ def calculate_cash_variance(
         - branch_id: Branch ID
         - branch_name: Branch name
         - date: Date of the calculation
-        - total_sales_amount: Total amount from completed cash sales
-        - cash_received_amount: Total cash received
-        - variance: Difference (cash_received - total_sales)
+        - total_sales_amount_usd: Total amount from completed sales (in USD)
+        - total_discount_usd: Total discount (in USD)
+        - total_tax_usd: Total tax (in USD)
+        - net_sales_amount_usd: Net sales amount after discount and tax (in USD)
+        - cash_received_amount_usd: Total cash received (converted to USD)
+        - variance_usd: Difference (cash_received - total_sales) in USD
         - variance_percentage: Variance as percentage of sales
-        - sales_count: Number of completed cash sales
-        - cash_received_entry: Cash received entry if exists
+        - sales_count: Number of completed sales
+        - has_cash_received_entries: Boolean indicating if any entries exist
+        - cash_received_entries_count: Number of cash received entries
+        - cash_received_by_type: Dictionary with amounts grouped by payment type
+        - cash_received_entries: List of all cash received entries with details
     """
     from accounts.models import User
     from organization.models import Branch
@@ -3407,11 +3604,14 @@ def calculate_cash_variance(
     if date is None:
         date = timezone.now().date()
     
-    # Build sales query
+    # Build sales query - include all payment types (cash, ecocash, bank transfer)
+    # Filter for cash-related payment methods
+    cash_payment_methods = ['usd_cash', 'zig_cash', 'ecocash_usd', 'ecocash_zig', 
+                            'bank_transfer_usd', 'bank_transfer_zig']
     sales_query = Sale.objects.filter(
         created_at__date=date,
         status='completed',
-        type_of_payment='cash'
+        type_of_payment__in=cash_payment_methods
     )
     
     if cashier_id:
@@ -3419,23 +3619,27 @@ def calculate_cash_variance(
     if branch_id:
         sales_query = sales_query.filter(branch_id=branch_id)
     
-    # Calculate total sales amount
-    sales_aggregate = sales_query.aggregate(
-        total_amount=Sum('total_amount'),
-        total_discount=Sum('discount'),
-        total_tax=Sum('tax'),
-        count=Count('id')
-    )
+    # Calculate total sales amount - convert all to USD for comparison
+    total_sales_amount_usd = Decimal('0')
+    total_discount_usd = Decimal('0')
+    total_tax_usd = Decimal('0')
+    sales_count = 0
     
-    total_sales_amount = sales_aggregate['total_amount'] or Decimal('0')
-    total_discount = sales_aggregate['total_discount'] or Decimal('0')
-    total_tax = sales_aggregate['total_tax'] or Decimal('0')
-    sales_count = sales_aggregate['count'] or 0
+    for sale in sales_query:
+        # Convert sale amounts to USD
+        sale_amount_usd = convert_zig_to_usd(sale.total_amount, sale.type_of_payment)
+        discount_usd = convert_zig_to_usd(sale.discount, sale.type_of_payment)
+        tax_usd = convert_zig_to_usd(sale.tax, sale.type_of_payment)
+        
+        total_sales_amount_usd += sale_amount_usd
+        total_discount_usd += discount_usd
+        total_tax_usd += tax_usd
+        sales_count += 1
     
-    # Net sales amount (after discount and tax)
-    net_sales_amount = total_sales_amount - total_discount + total_tax
+    # Net sales amount (after discount and tax) in USD
+    net_sales_amount_usd = total_sales_amount_usd - total_discount_usd + total_tax_usd
     
-    # Get cash received entry
+    # Get all cash received entries for the day (can be multiple - one per payment type)
     cash_received_query = CashReceived.objects.filter(date=date)
     
     if cashier_id:
@@ -3443,12 +3647,38 @@ def calculate_cash_variance(
     if branch_id:
         cash_received_query = cash_received_query.filter(branch_id=branch_id)
     
-    cash_received_entry = cash_received_query.first()
-    cash_received_amount = cash_received_entry.total_amount if cash_received_entry else Decimal('0')
+    cash_received_entries = list(cash_received_query.all())
     
-    # Calculate variance
-    variance = cash_received_amount - net_sales_amount
-    variance_percentage = (variance / net_sales_amount * 100) if net_sales_amount > 0 else Decimal('0')
+    # Aggregate all cash received amounts and convert to USD for comparison
+    cash_received_amount_usd = Decimal('0')
+    cash_received_by_type = {}
+    
+    for entry in cash_received_entries:
+        entry_amount_usd = convert_zig_to_usd(entry.total_amount, entry.type_of_payment)
+        cash_received_amount_usd += entry_amount_usd
+        
+        # Track amounts by payment type
+        if entry.type_of_payment not in cash_received_by_type:
+            cash_received_by_type[entry.type_of_payment] = {
+                'amount': Decimal('0'),
+                'amount_usd': Decimal('0'),
+                'entries': []
+            }
+        cash_received_by_type[entry.type_of_payment]['amount'] += entry.total_amount
+        cash_received_by_type[entry.type_of_payment]['amount_usd'] += entry_amount_usd
+        cash_received_by_type[entry.type_of_payment]['entries'].append({
+            'id': entry.id,
+            'total_amount': entry.total_amount,
+            'type_of_payment': entry.type_of_payment,
+            'type_of_payment_display': entry.get_type_of_payment_display(),
+            'entered_by': entry.entered_by.email if entry.entered_by else None,
+            'notes': entry.notes,
+            'created_at': entry.created_at,
+        })
+    
+    # Calculate variance (in USD)
+    variance = cash_received_amount_usd - net_sales_amount_usd
+    variance_percentage = (variance / net_sales_amount_usd * 100) if net_sales_amount_usd > 0 else Decimal('0')
     
     # Get cashier and branch info
     cashier_info = {}
@@ -3473,34 +3703,110 @@ def calculate_cash_variance(
             'branch_id': branch.id,
             'branch_name': branch.name,
         }
-    elif cash_received_entry:
+    elif cash_received_entries:
+        # Use the first entry's branch if branch_id not provided
+        first_entry = cash_received_entries[0]
         branch_info = {
-            'branch_id': cash_received_entry.branch.id,
-            'branch_name': cash_received_entry.branch.name,
+            'branch_id': first_entry.branch.id,
+            'branch_name': first_entry.branch.name,
         }
     
     result = {
         **cashier_info,
         **branch_info,
         'date': date,
-        'total_sales_amount': total_sales_amount,
-        'total_discount': total_discount,
-        'total_tax': total_tax,
-        'net_sales_amount': net_sales_amount,
-        'cash_received_amount': cash_received_amount,
-        'variance': variance,
+        'total_sales_amount_usd': total_sales_amount_usd,
+        'total_discount_usd': total_discount_usd,
+        'total_tax_usd': total_tax_usd,
+        'net_sales_amount_usd': net_sales_amount_usd,
+        'cash_received_amount_usd': cash_received_amount_usd,
+        'variance_usd': variance,
         'variance_percentage': variance_percentage,
         'sales_count': sales_count,
-        'has_cash_received_entry': cash_received_entry is not None,
+        'has_cash_received_entries': len(cash_received_entries) > 0,
+        'cash_received_entries_count': len(cash_received_entries),
+        'cash_received_by_type': cash_received_by_type,
     }
     
-    if cash_received_entry:
-        result['cash_received_entry'] = {
-            'id': cash_received_entry.id,
-            'entered_by': cash_received_entry.entered_by.email if cash_received_entry.entered_by else None,
-            'notes': cash_received_entry.notes,
-            'created_at': cash_received_entry.created_at,
-        }
+    # Include all cash received entries
+    if cash_received_entries:
+        result['cash_received_entries'] = [
+            {
+                'id': entry.id,
+                'total_amount': entry.total_amount,
+                'type_of_payment': entry.type_of_payment,
+                'type_of_payment_display': entry.get_type_of_payment_display(),
+                'entered_by': entry.entered_by.email if entry.entered_by else None,
+                'notes': entry.notes,
+                'created_at': entry.created_at,
+            }
+            for entry in cash_received_entries
+        ]
     
     return result
+
+
+# ========== Exchange Rate Helpers ==========
+
+def get_current_exchange_rate() -> Optional[ExchangeRate]:
+    """Return the single current exchange rate instance if it exists."""
+    return ExchangeRate.objects.first()
+
+
+def is_zig_payment_method(payment_method: str) -> bool:
+    """Check if the payment method is in ZIG currency."""
+    zig_payment_methods = ['zig_cash', 'ecocash_zig', 'bank_transfer_zig']
+    return payment_method in zig_payment_methods
+
+
+def convert_zig_to_usd(amount: Decimal, payment_method: str) -> Decimal:
+    """
+    Convert ZIG amount to USD if payment method is in ZIG.
+    Otherwise, return the amount as-is.
+    
+    Args:
+        amount: The amount to convert
+        payment_method: The payment method from the sale
+    
+    Returns:
+        Amount in USD (converted if ZIG, original if USD)
+    """
+    if not is_zig_payment_method(payment_method):
+        return amount
+    
+    exchange_rate = get_current_exchange_rate()
+    if not exchange_rate or not exchange_rate.current_rate:
+        # If no exchange rate is set, return original amount
+        # In production, you might want to raise an error here
+        return amount
+    
+    # Convert ZIG to USD by multiplying by current_rate
+    return amount / exchange_rate.current_rate
+
+
+def set_exchange_rate(current_rate: Decimal) -> ExchangeRate:
+    """
+    Create or update the current exchange rate.
+    Ensures only one record is kept.
+    
+    Args:
+        current_rate: The exchange rate value (must be greater than zero)
+    
+    Returns:
+        ExchangeRate instance
+    
+    Raises:
+        ValueError: If current_rate is not positive
+    """
+    if current_rate <= 0:
+        raise ValueError('Exchange rate must be greater than zero.')
+    
+    with transaction.atomic():
+        exchange_rate = ExchangeRate.objects.select_for_update().first()
+        if exchange_rate:
+            exchange_rate.current_rate = current_rate
+            exchange_rate.save(update_fields=['current_rate', 'updated_at'] if hasattr(exchange_rate, 'updated_at') else ['current_rate'])
+        else:
+            exchange_rate = ExchangeRate.objects.create(current_rate=current_rate)
+    return exchange_rate
 

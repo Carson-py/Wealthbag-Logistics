@@ -7,10 +7,11 @@ from drf_yasg import openapi
 from django.utils import timezone
 from datetime import timedelta
 from decimal import Decimal
+import io
 
 from .serializers import (
     ProductSerializer, CategorySerializer, UnitSerializer, CreateProductSerializer,
-    BulkCreateProductSerializer, BarcodeSerializer
+    BulkCreateProductSerializer, BarcodeSerializer, ImportProductsFromStockSheetSerializer
 )
 from .models import Barcode
 from django.db import models
@@ -19,6 +20,13 @@ from organization.models import Branch, Warehouse
 from . import services
 from shared.audit import log_activity, ActivityType
 from accounts.permissions import IsAdminOrOwner
+
+# Try to import openpyxl for Excel file reading
+try:
+    from openpyxl import load_workbook
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
 
 
 class CategoryListView(APIView):
@@ -43,6 +51,40 @@ class CategoryListView(APIView):
                 request=request,
             )
             return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ImportProductsFromStockSheetView(APIView):
+    """
+    Import products (and suppliers) from an Excel sheet using stock columns:
+    product name, description, selling prices, cost per unit, total quantity, supplier name, supplier email address.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @swagger_auto_schema(
+        request_body=ImportProductsFromStockSheetSerializer,
+        responses={201: openapi.Response(description='Products imported')}
+    )
+    def post(self, request):
+        serializer = ImportProductsFromStockSheetSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                result = services.import_products_from_stock_sheet(
+                    file_obj=serializer.validated_data['file'],
+                    notes=serializer.validated_data.get('notes', ''),
+                    created_by=request.user
+                )
+
+                log_activity(
+                    activity_type=ActivityType.CUSTOM,
+                    user=request.user,
+                    description=f"Imported products from stock sheet: {result['summary']['successful']} succeeded, {result['summary']['failed']} failed",
+                    request=request,
+                )
+
+                return Response(result, status=status.HTTP_201_CREATED)
+            except ValueError as exc:
+                return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -73,7 +115,7 @@ class ProductListView(APIView):
         branch_id = request.query_params.get('branch_id')
         products = Product.objects.all()
         
-        serializer = ProductSerializer(products, many=True)
+        serializer = ProductSerializer(products, many=True, context={'request': request})
         return Response(serializer.data)
     
     @swagger_auto_schema(request_body=CreateProductSerializer, responses={201: ProductSerializer})
@@ -87,6 +129,20 @@ class ProductListView(APIView):
             initial_purchase_price = data.pop('initial_purchase_price', None)
             supplier_id = data.pop('supplier_id', None)
             batch_number = data.pop('batch_number', None)  # Auto-generated if None
+            image = data.pop('image', None)  # Extract image if provided
+            
+            # Convert category and unit to IDs if they are instances
+            if 'category' in data and data['category'] is not None:
+                if hasattr(data['category'], 'id'):
+                    data['category'] = data['category'].id
+                elif not isinstance(data['category'], int):
+                    data['category'] = None
+            
+            if 'unit' in data and data['unit'] is not None:
+                if hasattr(data['unit'], 'id'):
+                    data['unit'] = data['unit'].id
+                elif not isinstance(data['unit'], int):
+                    data['unit'] = None
             
             # If no warehouse specified, use main warehouse
             if not initial_warehouse_id:
@@ -99,7 +155,8 @@ class ProductListView(APIView):
                         status=status.HTTP_400_BAD_REQUEST
                     )
             
-            product = services.create_product(**data)
+            # Create product with image if provided
+            product = services.create_product(image=image, **data)
             # Use purchase_price from product if not provided
             purchase_price = initial_purchase_price
             
@@ -121,7 +178,7 @@ class ProductListView(APIView):
                 related_object=product,
             )
             
-            return Response(ProductSerializer(product).data, status=status.HTTP_201_CREATED)
+            return Response(ProductSerializer(product, context={'request': request}).data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -135,7 +192,7 @@ class ProductDetailView(APIView):
             branch_id = request.query_params.get('branch_id')
             warehouse_id = request.query_params.get('warehouse_id')
             
-            serializer = ProductSerializer(product, context={'warehouse_id': warehouse_id})
+            serializer = ProductSerializer(product, context={'request': request, 'warehouse_id': warehouse_id})
             return Response(serializer.data)
         except Product.DoesNotExist:
             return Response({'detail': 'Product not found.'}, status=status.HTTP_404_NOT_FOUND)
@@ -145,7 +202,22 @@ class ProductDetailView(APIView):
         """Update a product"""
         try:
             product = Product.objects.get(pk=pk)
-            serializer = ProductSerializer(product, data=request.data)
+            data = request.data.copy()
+            
+            # Convert category and unit to IDs if they are instances
+            if 'category' in data and data['category'] is not None:
+                if hasattr(data['category'], 'id'):
+                    data['category'] = data['category'].id
+                elif not isinstance(data['category'], (int, str)):
+                    data['category'] = None
+            
+            if 'unit' in data and data['unit'] is not None:
+                if hasattr(data['unit'], 'id'):
+                    data['unit'] = data['unit'].id
+                elif not isinstance(data['unit'], (int, str)):
+                    data['unit'] = None
+            
+            serializer = ProductSerializer(product, data=data, partial=False)
             if serializer.is_valid():
                 serializer.save()
                 log_activity(
@@ -155,7 +227,7 @@ class ProductDetailView(APIView):
                     request=request,
                     related_object=product,
                 )
-                return Response(serializer.data)
+                return Response(ProductSerializer(product, context={'request': request}).data)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         except Product.DoesNotExist:
             return Response({'detail': 'Product not found.'}, status=status.HTTP_404_NOT_FOUND)
@@ -353,9 +425,13 @@ class BarcodeListView(APIView):
     )
     def get(self, request):
         """
-        Return all barcodes with associated product details.
+        Return all barcodes with associated product details and stock price information.
         This is ideal for frontend barcode lists and printing labels.
+        Includes purchase_price and selling_price from the most recent stock entry.
         """
+        from stock.models import StockEntry, BranchStock
+        from django.db.models import Prefetch
+        
         barcodes = Barcode.objects.select_related('product').all()
         
         product_id = request.query_params.get('product_id')
@@ -372,6 +448,302 @@ class BarcodeListView(APIView):
             elif val in ['false', '0', 'no']:
                 barcodes = barcodes.filter(is_primary=False)
         
-        barcodes = barcodes.order_by('-is_primary', 'product__name', 'barcode')
+        # Prefetch stock entries to optimize queries for price information
+        # Get the most recent stock entry for each product
+        warehouse_stock_prefetch = Prefetch(
+            'product__stock_entries',
+            queryset=StockEntry.objects.filter(quantity__gt=0)
+                .select_related('warehouse')
+                .order_by('-received_date', '-created_at'),
+            to_attr='recent_warehouse_stock'
+        )
+        
+        branch_stock_prefetch = Prefetch(
+            'product__branch_stock_entries',
+            queryset=BranchStock.objects.filter(quantity__gt=0)
+                .select_related('branch')
+                .order_by('-received_date', '-created_at'),
+            to_attr='recent_branch_stock'
+        )
+        
+        barcodes = barcodes.prefetch_related(
+            warehouse_stock_prefetch,
+            branch_stock_prefetch
+        ).order_by('-is_primary', 'product__name', 'barcode')
+        
         serializer = BarcodeSerializer(barcodes, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class RegenerateBarcodeView(APIView):
+    """
+    Regenerate barcode images with current selling prices from stock entries.
+    Supports regenerating a single barcode, all barcodes for a product, or all barcodes.
+    """
+    permission_classes = [IsAuthenticated]
+    
+    @swagger_auto_schema(
+        manual_parameters=[
+            openapi.Parameter(
+                'barcode_id',
+                openapi.IN_QUERY,
+                description='Regenerate specific barcode by ID',
+                type=openapi.TYPE_INTEGER,
+                required=False,
+            ),
+            openapi.Parameter(
+                'product_id',
+                openapi.IN_QUERY,
+                description='Regenerate all barcodes for a specific product',
+                type=openapi.TYPE_INTEGER,
+                required=False,
+            ),
+            openapi.Parameter(
+                'all',
+                openapi.IN_QUERY,
+                description='Regenerate all barcodes (use with caution)',
+                type=openapi.TYPE_BOOLEAN,
+                required=False,
+            ),
+        ],
+        responses={
+            200: openapi.Response(
+                description='Barcode regeneration results',
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'success': openapi.Schema(type=openapi.TYPE_BOOLEAN),
+                        'regenerated_count': openapi.Schema(type=openapi.TYPE_INTEGER),
+                        'failed_count': openapi.Schema(type=openapi.TYPE_INTEGER),
+                        'message': openapi.Schema(type=openapi.TYPE_STRING),
+                        'regenerated_barcodes': openapi.Schema(
+                            type=openapi.TYPE_ARRAY,
+                            items=openapi.Schema(type=openapi.TYPE_INTEGER)
+                        ),
+                        'failed_barcodes': openapi.Schema(
+                            type=openapi.TYPE_ARRAY,
+                            items=openapi.Schema(type=openapi.TYPE_INTEGER)
+                        ),
+                    }
+                )
+            ),
+            400: 'Bad request - invalid parameters',
+            404: 'Barcode or product not found',
+        }
+    )
+    def post(self, request):
+        """
+        Regenerate barcode images with current prices.
+        
+        Query parameters:
+        - barcode_id: Regenerate specific barcode by ID
+        - product_id: Regenerate all barcodes for a product
+        - all: Regenerate all barcodes (requires admin permission)
+        
+        At least one parameter must be provided.
+        """
+        barcode_id = request.query_params.get('barcode_id')
+        product_id = request.query_params.get('product_id')
+        regenerate_all = request.query_params.get('all', '').lower() in ['true', '1', 'yes']
+        
+        # Validate that at least one parameter is provided
+        if not any([barcode_id, product_id, regenerate_all]):
+            return Response(
+                {'error': 'At least one parameter (barcode_id, product_id, or all) must be provided'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check permission for bulk regeneration
+        if regenerate_all:
+            if request.user.role not in ['admin', 'owner']:
+                return Response(
+                    {'error': 'Admin permission required to regenerate all barcodes'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        
+        regenerated_count = 0
+        failed_count = 0
+        regenerated_barcodes = []
+        failed_barcodes = []
+        
+        try:
+            if barcode_id:
+                # Regenerate single barcode
+                try:
+                    barcode = Barcode.objects.get(pk=barcode_id)
+                    if services.regenerate_barcode_image(barcode):
+                        regenerated_count += 1
+                        regenerated_barcodes.append(barcode.id)
+                        
+                    else:
+                        failed_count += 1
+                        failed_barcodes.append(barcode.id)
+                except Barcode.DoesNotExist:
+                    return Response(
+                        {'error': f'Barcode with ID {barcode_id} not found'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+            
+            elif product_id:
+                # Regenerate all barcodes for a product
+                try:
+                    product = Product.objects.get(pk=product_id)
+                    barcodes = Barcode.objects.filter(product=product)
+                    
+                    if not barcodes.exists():
+                        return Response(
+                            {'error': f'No barcodes found for product ID {product_id}'},
+                            status=status.HTTP_404_NOT_FOUND
+                        )
+                    
+                    for barcode in barcodes:
+                        if services.regenerate_barcode_image(barcode):
+                            regenerated_count += 1
+                            regenerated_barcodes.append(barcode.id)
+                        else:
+                            failed_count += 1
+                            failed_barcodes.append(barcode.id)
+                    
+                except Product.DoesNotExist:
+                    return Response(
+                        {'error': f'Product with ID {product_id} not found'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+            
+            elif regenerate_all:
+                # Regenerate all barcodes
+                barcodes = Barcode.objects.all()
+                total_count = barcodes.count()
+                
+                if total_count == 0:
+                    return Response(
+                        {'error': 'No barcodes found'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+                
+                for barcode in barcodes:
+                    if services.regenerate_barcode_image(barcode):
+                        regenerated_count += 1
+                        regenerated_barcodes.append(barcode.id)
+                    else:
+                        failed_count += 1
+                        failed_barcodes.append(barcode.id)
+                
+            
+            message = f'Successfully regenerated {regenerated_count} barcode(s)'
+            if failed_count > 0:
+                message += f', {failed_count} failed'
+            
+            return Response({
+                'success': True,
+                'regenerated_count': regenerated_count,
+                'failed_count': failed_count,
+                'message': message,
+                'regenerated_barcodes': regenerated_barcodes,
+                'failed_barcodes': failed_barcodes,
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            return Response(
+                {'error': f'Error regenerating barcodes: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class ExcelProductUploadView(APIView):
+    """
+    Upload products from Excel file.
+    Expected columns (case-insensitive):
+      - product name
+      - description
+      - selling prices
+      - cost per unit
+      - total quantity
+      - supplier name
+      - supplier email address
+    If supplier does not exist it will be created; products are created if missing (description treated as unique key).
+    """
+    permission_classes = [IsAuthenticated]
+    
+    @swagger_auto_schema(
+        manual_parameters=[
+            openapi.Parameter(
+                'file',
+                openapi.IN_FORM,
+                description='Excel file (.xlsx) containing product data',
+                type=openapi.TYPE_FILE,
+                required=True
+            ),
+            openapi.Parameter(
+                'notes',
+                openapi.IN_FORM,
+                description='Optional notes for traceability',
+                type=openapi.TYPE_STRING,
+                required=False
+            )
+        ],
+        responses={
+            200: openapi.Response(
+                description='Products imported successfully',
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'created': openapi.Schema(type=openapi.TYPE_ARRAY, items=openapi.Schema(type=openapi.TYPE_OBJECT)),
+                        'errors': openapi.Schema(type=openapi.TYPE_ARRAY, items=openapi.Schema(type=openapi.TYPE_OBJECT)),
+                        'summary': openapi.Schema(
+                            type=openapi.TYPE_OBJECT,
+                            properties={
+                                'total': openapi.Schema(type=openapi.TYPE_INTEGER),
+                                'successful': openapi.Schema(type=openapi.TYPE_INTEGER),
+                                'failed': openapi.Schema(type=openapi.TYPE_INTEGER)
+                            }
+                        )
+                    }
+                )
+            ),
+            400: openapi.Response('Bad request - invalid file or format'),
+        },
+        consumes=['multipart/form-data']
+    )
+    def post(self, request):
+        """Upload products from Excel file"""
+        if not OPENPYXL_AVAILABLE:
+            return Response(
+                {'detail': 'openpyxl library is required for Excel upload. Install with: pip install openpyxl'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get uploaded file
+        excel_file = request.FILES.get('file')
+        if not excel_file:
+            return Response(
+                {'detail': 'Excel file is required. Please upload a .xlsx file.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate file extension
+        if not excel_file.name.endswith(('.xlsx', '.xls')):
+            return Response(
+                {'detail': 'Invalid file format. Please upload a .xlsx or .xls file.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            result = services.import_products_from_stock_sheet(
+                file_obj=excel_file,
+                notes=request.data.get('notes', ''),
+                created_by=request.user
+            )
+
+            log_activity(
+                activity_type=ActivityType.CUSTOM,
+                user=request.user,
+                description=f"Imported products from Excel: {result['summary']['successful']} succeeded, {result['summary']['failed']} failed",
+                request=request,
+            )
+
+            return Response(result, status=status.HTTP_201_CREATED)
+        except ValueError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'detail': f'Error processing Excel file: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)

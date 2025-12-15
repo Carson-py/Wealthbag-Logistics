@@ -12,6 +12,7 @@ class SupplierSerializer(serializers.ModelSerializer):
 
 class StockEntrySerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
+    product_description = serializers.CharField(source='product.description', read_only=True)
     product_sku = serializers.CharField(source='product.sku', read_only=True)
     warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
     supplier_name = serializers.CharField(source='supplier.name', read_only=True)
@@ -24,8 +25,8 @@ class StockEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model = StockEntry
         fields = [
-            'id', 'product', 'product_name', 'product_sku', 'warehouse', 'warehouse_name',
-            'supplier', 'supplier_name', 'quantity', 'reorder_level', 'purchase_price', 'total_cost',
+            'id', 'product', 'product_name', 'product_description', 'product_sku', 'warehouse', 'warehouse_name',
+            'supplier', 'supplier_name', 'quantity', 'reorder_level', 'purchase_price', 'selling_price', 'total_cost',
             'batch_number', 'original_batch_number', 'received_date', 'notes',
             'is_initial_stock', 'source_transfer', 'source_transfer_reference',
             'original_stock_entry', 'original_stock_entry_id', 'entry_group', 'entry_group_reference',
@@ -60,6 +61,7 @@ class StockEntryGroupSerializer(serializers.ModelSerializer):
 class StockAdjustmentSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_sku = serializers.CharField(source='product.sku', read_only=True)
+    product_description = serializers.CharField(source='product.description', read_only=True)
     warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
     created_by_email = serializers.CharField(source='created_by.email', read_only=True)
     
@@ -136,6 +138,39 @@ class BulkAddStockSerializer(serializers.Serializer):
             raise serializers.ValidationError('At least one stock entry must be provided.')
         return value
 
+
+class ImportStockFromExcelSerializer(serializers.Serializer):
+    """
+    Upload an Excel file (.xlsx) to add stock into a warehouse.
+    Required columns (case-insensitive):
+        - product name
+        - description
+        - selling prices
+        - cost per unit
+        - total quantity
+        - supplier name
+        - supplier email address
+    """
+    file = serializers.FileField(required=True, help_text='Excel file (.xlsx)')
+    # Warehouse will be forced to main warehouse in the view; keep optional to avoid validation error
+    warehouse_id = serializers.IntegerField(required=False, allow_null=True, help_text='Destination warehouse ID (ignored; main warehouse is used)')
+    notes = serializers.CharField(required=False, allow_blank=True, help_text='Optional notes applied to all entries')
+
+
+class ImportProductsFromExcelSerializer(serializers.Serializer):
+    """
+    Upload an Excel file (.xlsx) to create products (and suppliers if missing).
+    Uses the same columns as stock import:
+        - product name
+        - description
+        - selling prices
+        - cost per unit
+        - total quantity
+        - supplier name
+        - supplier email address
+    """
+    file = serializers.FileField(required=True, help_text='Excel file (.xlsx)')
+    notes = serializers.CharField(required=False, allow_blank=True, help_text='Optional notes (ignored in creation, returned for traceability)')
 
 class RemoveStockSerializer(serializers.Serializer):
     product_id = serializers.IntegerField(required=True)
@@ -277,7 +312,7 @@ class TransferItemSerializer(serializers.Serializer):
     product_id = serializers.IntegerField(required=True)
     quantity = serializers.DecimalField(max_digits=12, decimal_places=2, required=True)
     reorder_level = serializers.IntegerField(required=False, allow_null=True, help_text='Reorder level (optional)')
-    selling_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True, help_text='Selling price (required when transferring to a branch)')
+    selling_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True, help_text='Selling price (optional; will be taken from source stock entry if not provided when transferring to a branch)')
     supplier_id = serializers.IntegerField(required=False, allow_null=True, help_text='Supplier ID (optional)')
     batch_number = serializers.CharField(required=False, allow_blank=True, help_text='Batch number (optional)')
     notes = serializers.CharField(required=False, allow_blank=True, help_text='Item-specific notes (optional)')
@@ -290,7 +325,7 @@ class CreateStockTransferSerializer(serializers.Serializer):
     product_id = serializers.IntegerField(required=False, allow_null=True, help_text='Product ID (required if items not provided)')
     quantity = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True, help_text='Quantity (required if items not provided)')
     reorder_level = serializers.IntegerField(required=False, allow_null=True, help_text='Reorder level (optional, for single product)')
-    selling_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True, help_text='Selling price (required when transferring to a branch, for single product)')
+    selling_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True, help_text='Selling price (optional; will be taken from source stock entry if not provided when transferring to a branch)')
     supplier_id = serializers.IntegerField(required=False, allow_null=True, help_text='Supplier ID (optional, for single product)')
     batch_number = serializers.CharField(required=False, allow_blank=True, help_text='Batch number (optional, for single product)')
     
@@ -352,23 +387,16 @@ class CreateStockTransferSerializer(serializers.Serializer):
                     'Cannot provide both items and single product fields. Use items for multi-product transfers.'
                 )
             
-            if transfer_type in ['warehouse_to_branch', 'branch_to_branch']:
-                missing_indices = [
-                    index for index, item in enumerate(items)
-                    if item.get('selling_price') is None
-                ]
-                if missing_indices:
-                    raise serializers.ValidationError(
-                        f'Selling price is required for items transferring to a branch (missing for item indices: {missing_indices}).'
-                    )
+            # Selling price is optional - will be automatically taken from source stock entry if not provided
+            # No validation needed here as it will be handled in the service layer
         else:
             # Single product transfer (backward compatibility)
             if not product_id or quantity is None:
                 raise serializers.ValidationError(
                     'Either provide items (for multi-product) or product_id and quantity (for single product).'
                 )
-            if transfer_type in ['warehouse_to_branch', 'branch_to_branch'] and selling_price is None:
-                raise serializers.ValidationError('Selling price is required when transferring stock to a branch.')
+            # Selling price is optional - will be automatically taken from source stock entry if not provided
+            # No validation needed here as it will be handled in the service layer
         
         return data
 
@@ -383,4 +411,139 @@ class BulkCreateStockTransferSerializer(serializers.Serializer):
         if not value or len(value) == 0:
             raise serializers.ValidationError('At least one transfer must be provided.')
         return value
+
+
+class ImportStockTransfersFromExcelSerializer(serializers.Serializer):
+    """Serializer for importing stock transfers from Excel file
+    
+    transfer_type, source, and destination must be provided as parameters.
+    Excel file should only contain product information (product_name, description, quantity, etc.)
+    
+    Source and destination can be provided as either IDs or names.
+    """
+    file = serializers.FileField(
+        required=True,
+        help_text='Excel file (.xlsx) containing product data for transfers'
+    )
+    transfer_type = serializers.ChoiceField(
+        choices=['warehouse_to_warehouse', 'warehouse_to_branch', 'branch_to_branch', 'branch_to_warehouse'],
+        required=True,
+        help_text='Transfer type (required)'
+    )
+    source_warehouse_id = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text='Source warehouse ID or name (required for warehouse_to_* transfers)'
+    )
+    source_branch_id = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text='Source branch ID or name (required for branch_to_* transfers)'
+    )
+    destination_warehouse_id = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text='Destination warehouse ID or name (required for *_to_warehouse transfers)'
+    )
+    destination_branch_id = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text='Destination branch ID or name (required for *_to_branch transfers)'
+    )
+    reference_number = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text='Reference number for transfers (optional, auto-generated if not provided)'
+    )
+    notes = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text='Notes for transfers'
+    )
+    
+    def _resolve_warehouse_id(self, value):
+        """Convert warehouse ID or name to ID"""
+        if not value:
+            return None
+        
+        # Try as integer ID first
+        try:
+            warehouse_id = int(value)
+            from organization.models import Warehouse
+            if Warehouse.objects.filter(id=warehouse_id).exists():
+                return warehouse_id
+        except (ValueError, TypeError):
+            pass
+        
+        # Try as name
+        from organization.models import Warehouse
+        warehouse = Warehouse.objects.filter(name__iexact=str(value).strip()).first()
+        if warehouse:
+            return warehouse.id
+        
+        raise serializers.ValidationError(f'Warehouse not found: {value}')
+    
+    def _resolve_branch_id(self, value):
+        """Convert branch ID or name to ID"""
+        if not value:
+            return None
+        
+        # Try as integer ID first
+        try:
+            branch_id = int(value)
+            from organization.models import Branch
+            if Branch.objects.filter(id=branch_id).exists():
+                return branch_id
+        except (ValueError, TypeError):
+            pass
+        
+        # Try as name
+        from organization.models import Branch
+        branch = Branch.objects.filter(name__iexact=str(value).strip()).first()
+        if branch:
+            return branch.id
+        
+        raise serializers.ValidationError(f'Branch not found: {value}')
+    
+    def validate(self, data):
+        """Validate that source and destination are provided based on transfer_type and resolve names to IDs"""
+        transfer_type = data.get('transfer_type')
+        
+        # Resolve warehouse/branch names to IDs
+        if data.get('source_warehouse_id'):
+            data['source_warehouse_id'] = self._resolve_warehouse_id(data['source_warehouse_id'])
+        if data.get('source_branch_id'):
+            data['source_branch_id'] = self._resolve_branch_id(data['source_branch_id'])
+        if data.get('destination_warehouse_id'):
+            data['destination_warehouse_id'] = self._resolve_warehouse_id(data['destination_warehouse_id'])
+        if data.get('destination_branch_id'):
+            data['destination_branch_id'] = self._resolve_branch_id(data['destination_branch_id'])
+        
+        # Validate required fields based on transfer_type
+        if transfer_type == 'warehouse_to_warehouse':
+            if not data.get('source_warehouse_id'):
+                raise serializers.ValidationError('source_warehouse_id (or name) is required for warehouse_to_warehouse transfers')
+            if not data.get('destination_warehouse_id'):
+                raise serializers.ValidationError('destination_warehouse_id (or name) is required for warehouse_to_warehouse transfers')
+        elif transfer_type == 'warehouse_to_branch':
+            if not data.get('source_warehouse_id'):
+                raise serializers.ValidationError('source_warehouse_id (or name) is required for warehouse_to_branch transfers')
+            if not data.get('destination_branch_id'):
+                raise serializers.ValidationError('destination_branch_id (or name) is required for warehouse_to_branch transfers')
+        elif transfer_type == 'branch_to_branch':
+            if not data.get('source_branch_id'):
+                raise serializers.ValidationError('source_branch_id (or name) is required for branch_to_branch transfers')
+            if not data.get('destination_branch_id'):
+                raise serializers.ValidationError('destination_branch_id (or name) is required for branch_to_branch transfers')
+        elif transfer_type == 'branch_to_warehouse':
+            if not data.get('source_branch_id'):
+                raise serializers.ValidationError('source_branch_id (or name) is required for branch_to_warehouse transfers')
+            if not data.get('destination_warehouse_id'):
+                raise serializers.ValidationError('destination_warehouse_id (or name) is required for branch_to_warehouse transfers')
+        
+        return data
 

@@ -1,5 +1,7 @@
 from decimal import Decimal
+from multiprocessing import parent_process
 from operator import isub
+from urllib.parse import parse_qs
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from django.db.models import Q, F, Sum
@@ -10,7 +12,7 @@ from rest_framework.permissions import IsAuthenticated
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 
-from .models import Sale, SaleItem, Discount, ProductReturn, CashReceived
+from .models import Sale, SaleItem, Discount, ProductReturn, CashReceived, ExchangeRate
 from .serializers import (
     SaleSerializer,
     ProductReturnSerializer,
@@ -26,6 +28,8 @@ from .serializers import (
     ReturnAuthorizationCodeCreateSerializer,
     CashReceivedSerializer,
     CashReceivedCreateSerializer,
+    CashReceivedUpdateSerializer,
+    ExchangeRateSerializer,
 )
 from . import services
 from shared.audit import log_activity, ActivityType
@@ -56,8 +60,28 @@ class SaleListCreateView(APIView):
         responses={200: SaleSerializer(many=True)}
     )
     def get(self, request):
-        """List sales with optional filters."""
+        """List sales with optional filters. Cashiers can only view their own sales."""
         sales = Sale.objects.select_related('branch', 'cashier').prefetch_related('items__product', 'returns__product')
+
+        # Role-based filtering
+        user_role = getattr(request.user, 'role', None)
+        
+        if user_role == 'cashier':
+            # Cashiers can only view their own sales
+            sales = sales.filter(cashier=request.user)
+        elif user_role == 'branch_manager':
+            # Branch managers can view all sales in their branch
+            profile = getattr(request.user, 'profile', None)
+            if profile:
+                employee = profile.first()
+                if employee and employee.branch:
+                    sales = sales.filter(branch=employee.branch)
+                else:
+                    # If not assigned to a branch, return empty
+                    sales = sales.none()
+            else:
+                sales = sales.none()
+        # Admin and owner can view all sales (no additional filter)
 
         branch_id = request.query_params.get('branch_id')
         status_filter = request.query_params.get('status')
@@ -66,8 +90,20 @@ class SaleListCreateView(APIView):
         search = request.query_params.get('search')
         sync_id = request.query_params.get('sync_id')
 
+        # Apply additional filters (respecting role-based restrictions)
         if branch_id:
+            # For branch managers, validate they can only filter by their own branch
+            if user_role == 'branch_manager':
+                profile = getattr(request.user, 'profile', None)
+                if profile:
+                    employee = profile.first()
+                    if employee and employee.branch and int(branch_id) != employee.branch.id:
+                        return Response(
+                            {'detail': 'You can only view sales for your branch.'},
+                            status=status.HTTP_403_FORBIDDEN
+                        )
             sales = sales.filter(branch_id=branch_id)
+        
         if status_filter:
             sales = sales.filter(status=status_filter)
         if start_date:
@@ -102,13 +138,11 @@ class SaleListCreateView(APIView):
                     discount_code=serializer.validated_data.get('discount_code'),
                     discount_id=serializer.validated_data.get('discount_id'),
                 )
-                if sale.type_of_payment == 'cash':
+                if sale.type_of_payment in ['usd_cash', 'zig_cash', 'bank_transfer_zig', 'bank_transfer_usd']:
                     services.complete_sale(sale, completed_by=request.user)
-                elif sale.type_of_payment == 'ecocash':
+                elif sale.type_of_payment in ['ecocash_usd', 'ecocash_zig']:
                     pass
-                elif sale.type_of_payment == 'one_money':
-                    pass
-                elif sale.type_of_payment == 'bank_transfer':
+                else:
                     pass
 
                 log_activity(
@@ -160,13 +194,11 @@ class BulkSaleCreateView(APIView):
             )
 
             for sale in created_sales:
-                if sale.type_of_payment == 'cash':
+                if sale.type_of_payment in ['usd_cash', 'zig_cash', 'bank_transfer_zig', 'bank_transfer_usd']:
                     services.complete_sale(sale, completed_by=request.user)
-                elif sale.type_of_payment == 'ecocash':
+                elif sale.type_of_payment in ['ecocash_usd', 'ecocash_zig']:
                     pass
-                elif sale.type_of_payment == 'one_money':
-                    pass
-                elif sale.type_of_payment == 'bank_transfer':
+                else:
                     pass
 
             response_data = {
@@ -1031,6 +1063,7 @@ class CashReceivedListCreateView(APIView):
                 branch_id = serializer.validated_data['branch'].id
                 date = serializer.validated_data['date']
                 total_amount = serializer.validated_data['total_amount']
+                type_of_payment = serializer.validated_data.get('type_of_payment', 'usd_cash')
                 notes = serializer.validated_data.get('notes', '')
                 
                 # Verify manager has access to the branch
@@ -1050,6 +1083,7 @@ class CashReceivedListCreateView(APIView):
                     date=date,
                     total_amount=total_amount,
                     entered_by=request.user,
+                    type_of_payment=type_of_payment,
                     notes=notes
                 )
                 
@@ -1071,6 +1105,94 @@ class CashReceivedListCreateView(APIView):
                 )
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+    @swagger_auto_schema(
+        request_body=CashReceivedUpdateSerializer,
+        responses={200: CashReceivedSerializer}
+    )
+    def put(self, request, pk):
+        """Update a cash received entry. Only branch managers can update, and only on the same day."""
+        # Check if user is a manager
+        if request.user.role not in ['branch_manager', 'admin', 'owner']:
+            return Response(
+                {'detail': 'Only managers can update cash received entries.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        try:
+            # Get the cash received entry
+            cash_received = CashReceived.objects.select_related('cashier', 'branch', 'entered_by').get(pk=pk)
+        except CashReceived.DoesNotExist:
+            return Response(
+                {'detail': 'Cash received entry not found.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Security check: Only allow updates on the same day the cash was received
+        today = timezone.now().date()
+        if cash_received.date != today:
+            return Response(
+                {'detail': 'Cash received entries can only be updated on the same day they were recorded.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Verify manager has access to the branch
+        if request.user.role == 'branch_manager':
+            profile = getattr(request.user, 'profile', None)
+            if profile:
+                employee = profile.first()
+                if employee and employee.branch_id != cash_received.branch_id:
+                    return Response(
+                        {'detail': 'You can only update cash received entries for your branch.'},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+        
+        # Validate and update
+        serializer = CashReceivedUpdateSerializer(cash_received, data=request.data, partial=True)
+        if serializer.is_valid():
+            try:
+                # Track changes for audit log
+                old_amount = cash_received.total_amount
+                old_notes = cash_received.notes
+                
+                # Update the entry
+                serializer.save()
+                
+                # Refresh from database to get updated values
+                cash_received.refresh_from_db()
+                
+                # Log the activity
+                changes = {}
+                if old_amount != cash_received.total_amount:
+                    changes['total_amount'] = {
+                        'old': str(old_amount),
+                        'new': str(cash_received.total_amount)
+                    }
+                if old_notes != cash_received.notes:
+                    changes['notes'] = {
+                        'old': old_notes,
+                        'new': cash_received.notes
+                    }
+                
+                log_activity(
+                    activity_type=ActivityType.SALE_UPDATED,  # Using existing activity type
+                    user=request.user,
+                    description=f'Updated cash received entry (ID: {cash_received.id}) for cashier {cash_received.cashier.email if cash_received.cashier else "Unknown"} on {cash_received.date}',
+                    request=request,
+                    related_object=cash_received,
+                    metadata={'changes': changes} if changes else None
+                )
+                
+                return Response(
+                    CashReceivedSerializer(cash_received).data,
+                    status=status.HTTP_200_OK
+                )
+            except Exception as e:
+                return Response(
+                    {'detail': str(e)},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class CashVarianceView(APIView):
     permission_classes = [IsAuthenticated]
@@ -1129,3 +1251,135 @@ class CashVarianceView(APIView):
                 {'detail': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+
+class ExchangeRateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @swagger_auto_schema(responses={200: ExchangeRateSerializer})
+    def get(self, request):
+        """Retrieve the current exchange rate."""
+        exchange_rate = services.get_current_exchange_rate()
+        if not exchange_rate:
+            return Response({'detail': 'Exchange rate not set.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(ExchangeRateSerializer(exchange_rate).data, status=status.HTTP_200_OK)
+
+    @swagger_auto_schema(
+        request_body=ExchangeRateSerializer,
+        responses={
+            201: ExchangeRateSerializer,
+            400: 'Bad Request - Exchange rate already exists or validation error'
+        }
+    )
+    def post(self, request):
+        """Create a new exchange rate. Admins/owners only. Use PUT to update existing rate."""
+        if getattr(request.user, 'role', None) not in {'admin', 'owner'}:
+            return Response(
+                {'detail': 'Only admins or owners can create the exchange rate.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = ExchangeRateSerializer(data=request.data)
+        if serializer.is_valid():
+            existing = services.get_current_exchange_rate()
+            if existing:
+                return Response(
+                    {'detail': 'Exchange rate already exists. Use PUT method to update it.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            exchange_rate = services.set_exchange_rate(serializer.validated_data['current_rate'])
+
+            log_activity(
+                activity_type=ActivityType.CUSTOM,
+                user=request.user,
+                description=f'Created exchange rate: {exchange_rate.current_rate}',
+                request=request,
+                related_object=exchange_rate,
+            )
+
+            return Response(ExchangeRateSerializer(exchange_rate).data, status=status.HTTP_201_CREATED)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @swagger_auto_schema(
+        request_body=ExchangeRateSerializer,
+        responses={
+            200: ExchangeRateSerializer,
+            404: 'Exchange rate not found',
+            400: 'Bad Request - Validation error'
+        }
+    )
+    def put(self, request):
+        """Update the current exchange rate. Admins/owners only."""
+        if getattr(request.user, 'role', None) not in {'admin', 'owner'}:
+            return Response(
+                {'detail': 'Only admins or owners can update the exchange rate.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = ExchangeRateSerializer(data=request.data)
+        if serializer.is_valid():
+            existing = services.get_current_exchange_rate()
+            if not existing:
+                return Response(
+                    {'detail': 'Exchange rate does not exist. Use POST method to create it.'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            old_rate = existing.current_rate
+            exchange_rate = services.set_exchange_rate(serializer.validated_data['current_rate'])
+
+            log_activity(
+                activity_type=ActivityType.CUSTOM,
+                user=request.user,
+                description=f'Updated exchange rate from {old_rate} to {exchange_rate.current_rate}',
+                request=request,
+                related_object=exchange_rate,
+            )
+
+            return Response(ExchangeRateSerializer(exchange_rate).data, status=status.HTTP_200_OK)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @swagger_auto_schema(
+        request_body=ExchangeRateSerializer,
+        responses={
+            200: ExchangeRateSerializer,
+            201: ExchangeRateSerializer,
+            400: 'Bad Request - Validation error'
+        }
+    )
+    def patch(self, request):
+        """Create or update the exchange rate. Admins/owners only. Creates if not exists, updates if exists."""
+        if getattr(request.user, 'role', None) not in {'admin', 'owner'}:
+            return Response(
+                {'detail': 'Only admins or owners can create or update the exchange rate.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = ExchangeRateSerializer(data=request.data)
+        if serializer.is_valid():
+            existing = services.get_current_exchange_rate()
+            old_rate = existing.current_rate if existing else None
+            
+            exchange_rate = services.set_exchange_rate(serializer.validated_data['current_rate'])
+
+            action = 'Updated' if existing else 'Created'
+            description = (
+                f'{action} exchange rate'
+                + (f' from {old_rate} to {exchange_rate.current_rate}' if old_rate else f': {exchange_rate.current_rate}')
+            )
+
+            log_activity(
+                activity_type=ActivityType.CUSTOM,
+                user=request.user,
+                description=description,
+                request=request,
+                related_object=exchange_rate,
+            )
+
+            status_code = status.HTTP_200_OK if existing else status.HTTP_201_CREATED
+            return Response(ExchangeRateSerializer(exchange_rate).data, status=status_code)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

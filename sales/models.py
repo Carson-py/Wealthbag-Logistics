@@ -18,10 +18,12 @@ class Sale(models.Model):
     ]
 
     TYPE_OF_PAYMENT_CHOICES = [
-        ('cash', 'Cash'),
-        ('ecocash', 'Ecocash'),
-        ('one_money', 'One Money'),
-        ('bank_transfer', 'Bank Transfer')
+        ('usd_cash', 'USD Cash'),
+        ('zig_cash', 'ZIG Cash'),
+        ('ecocash_usd', 'Ecocash USD'),
+        ('ecocash_zig', 'Ecocash ZIG'),
+        ('bank_transfer_zig', 'Bank Transfer ZIG'),
+        ('bank_transfer_usd', 'Bank Transfer USD')
     ]
     
     sync_id = models.CharField(max_length=50, unique=True, verbose_name='Sync ID', null=True, blank=True)
@@ -51,8 +53,25 @@ class Sale(models.Model):
     
     @property
     def net_amount(self):
-        """Calculate net amount after discount and tax"""
-        return self.total_amount - self.discount + self.tax
+        """
+        Calculate net amount after all discounts (item-level and sale-level) and tax.
+
+        - Item-level discounts are stored on `SaleItem.discount` and reflected in `SaleItem.subtotal`.
+        - `Sale.total_amount` is intended to be the sum of item subtotals, but we
+          recompute here from items to ensure accuracy even if totals weren't refreshed.
+        - Sale-level discounts are stored on `Sale.discount` and applied on top.
+        """
+        # Derive items total from unit price, quantity and item discount so that
+        # net amount is always correct even if stored subtotals are stale.
+        items_total = Decimal('0')
+        for item in self.items.all():
+            line_total = (item.unit_price * item.quantity) - (item.discount or Decimal('0'))
+            items_total += line_total
+            
+        sale_level_discount = self.discount or Decimal('0')
+        tax_amount = self.tax or Decimal('0')
+
+        return items_total - sale_level_discount + tax_amount
 
 
 class SaleItem(models.Model):
@@ -305,6 +324,9 @@ class CashReceived(models.Model):
     total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0, 
                                        verbose_name='Total Cash Received', 
                                        help_text='Total amount of cash received from the cashier')
+    type_of_payment = models.CharField(max_length=20, choices=Sale.TYPE_OF_PAYMENT_CHOICES, default='usd_cash',
+                                       verbose_name='Type of Payment',
+                                       help_text='Currency and payment method for the cash received')
     entered_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, 
                                   related_name='entered_cash_received',
                                   verbose_name='Entered By', 
@@ -318,14 +340,22 @@ class CashReceived(models.Model):
         verbose_name = 'Cash Received'
         verbose_name_plural = 'Cash Received'
         ordering = ['-date', '-created_at']
-        unique_together = ['cashier', 'branch', 'date']  # One entry per cashier per branch per day
+        unique_together = ['cashier', 'branch', 'date', 'type_of_payment']  # One entry per cashier per branch per day per payment type
         indexes = [
             models.Index(fields=['cashier', 'date']),
             models.Index(fields=['branch', 'date']),
             models.Index(fields=['date']),
+            models.Index(fields=['cashier', 'branch', 'date', 'type_of_payment']),
         ]
 
     def __str__(self):
         cashier_name = self.cashier.email if self.cashier else 'Unknown'
         return f"{cashier_name} - {self.date} - ${self.total_amount}"
+
+
+class ExchangeRate(models.Model):
+    current_rate = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name='Current Rate')
+
+    def __str__(self):
+        return str(self.current_rate)
     

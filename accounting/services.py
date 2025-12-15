@@ -8,6 +8,7 @@ from django.db.models.functions import TruncDate, TruncMonth
 
 from organization.models import Branch
 from sales.models import Sale, SaleItem
+from sales import services as sales_services
 from .models import Expense, ExpenseCategory, ProfitLossReport
 
 
@@ -44,13 +45,24 @@ def generate_profit_loss_report(*, start_date, end_date, branch_id: Optional[int
 
     sale_items = SaleItem.objects.filter(sale__status='completed',
                                          sale__created_at__date__gte=start_date,
-                                         sale__created_at__date__lte=end_date)
+                                         sale__created_at__date__lte=end_date).select_related('sale')
     if branch_id:
         sale_items = sale_items.filter(sale__branch_id=branch_id)
 
-    revenue = sale_items.aggregate(total=Sum('subtotal'))['total'] or Decimal('0')
-    cost_expr = ExpressionWrapper(F('purchase_price') * F('quantity'), output_field=DecimalField(max_digits=14, decimal_places=2))
-    cost_of_goods = sale_items.aggregate(total=Sum(cost_expr))['total'] or Decimal('0')
+    # Calculate revenue and cost, converting ZIG amounts to USD
+    revenue = Decimal('0')
+    cost_of_goods = Decimal('0')
+    
+    for item in sale_items:
+        payment_method = item.sale.type_of_payment
+        # Convert subtotal (revenue) from ZIG to USD if needed
+        item_revenue = sales_services.convert_zig_to_usd(item.subtotal, payment_method)
+        revenue += item_revenue
+        
+        # Convert cost from ZIG to USD if needed
+        item_cost = item.purchase_price * item.quantity
+        item_cost_usd = sales_services.convert_zig_to_usd(item_cost, payment_method)
+        cost_of_goods += item_cost_usd
 
     expense_queryset = Expense.objects.filter(
         Q(incurred_on__gte=start_date, incurred_on__lte=end_date) |
@@ -60,7 +72,6 @@ def generate_profit_loss_report(*, start_date, end_date, branch_id: Optional[int
         expense_queryset = expense_queryset.filter(branch_id=branch_id)
 
     total_expenses = expense_queryset.aggregate(total=Sum('amount'))['total'] or Decimal('0')
-    print(total_expenses)
     grosss_profit = revenue - cost_of_goods
     net_profit = grosss_profit - total_expenses
 
@@ -99,60 +110,98 @@ def get_sales_report(*, start_date, end_date, branch_id: Optional[int], group_by
     if branch_id:
         sales = sales.filter(branch_id=branch_id)
 
-    sale_items = SaleItem.objects.filter(sale__in=sales)
+    sale_items = SaleItem.objects.filter(sale__in=sales).select_related('sale')
+    
+    # Calculate total sales converting ZIG amounts to USD
+    total_sales = Decimal('0')
+    for item in sale_items:
+        payment_method = item.sale.type_of_payment
+        item_sales = sales_services.convert_zig_to_usd(item.subtotal, payment_method)
+        total_sales += item_sales
+    
     summary = {
         'total_orders': sales.count(),
         'total_units_sold': sale_items.aggregate(total=Sum('quantity'))['total'] or Decimal('0'),
-        'total_sales': sale_items.aggregate(total=Sum('subtotal'))['total'] or Decimal('0'),
+        'total_sales': total_sales,
     }
     summary['average_order_value'] = (summary['total_sales'] / summary['total_orders']) if summary['total_orders'] else Decimal('0')
 
     breakdown = []
     if group_by == 'month':
-        grouped = sale_items.annotate(period=TruncMonth('sale__created_at')).values('period').annotate(
-            total_sales=Sum('subtotal'),
-            total_units=Sum('quantity')
-        ).order_by('period')
-        for row in grouped:
+        # Group by month and convert ZIG amounts
+        from collections import defaultdict
+        month_data = defaultdict(lambda: {'total_sales': Decimal('0'), 'total_units': Decimal('0')})
+        for item in sale_items:
+            period_key = item.sale.created_at.strftime('%Y-%m')
+            payment_method = item.sale.type_of_payment
+            item_sales = sales_services.convert_zig_to_usd(item.subtotal, payment_method)
+            month_data[period_key]['total_sales'] += item_sales
+            month_data[period_key]['total_units'] += item.quantity
+        
+        for period_key in sorted(month_data.keys()):
             breakdown.append({
-                'label': row['period'].strftime('%Y-%m'),
-                'total_sales': row['total_sales'] or Decimal('0'),
-                'total_units': row['total_units'] or Decimal('0'),
+                'label': period_key,
+                'total_sales': month_data[period_key]['total_sales'],
+                'total_units': month_data[period_key]['total_units'],
             })
     elif group_by == 'branch':
-        grouped = sale_items.values('sale__branch_id', 'sale__branch__name').annotate(
-            total_sales=Sum('subtotal'),
-            total_units=Sum('quantity')
-        ).order_by('sale__branch__name')
-        for row in grouped:
+        # Group by branch and convert ZIG amounts
+        from collections import defaultdict
+        branch_data = defaultdict(lambda: {'total_sales': Decimal('0'), 'total_units': Decimal('0'), 'branch_name': ''})
+        for item in sale_items:
+            branch_id = item.sale.branch_id
+            branch_name = item.sale.branch.name if item.sale.branch else ''
+            payment_method = item.sale.type_of_payment
+            item_sales = sales_services.convert_zig_to_usd(item.subtotal, payment_method)
+            branch_data[branch_id]['total_sales'] += item_sales
+            branch_data[branch_id]['total_units'] += item.quantity
+            branch_data[branch_id]['branch_name'] = branch_name
+        
+        for branch_id in sorted(branch_data.keys()):
             breakdown.append({
-                'branch_id': row['sale__branch_id'],
-                'branch_name': row['sale__branch__name'],
-                'total_sales': row['total_sales'] or Decimal('0'),
-                'total_units': row['total_units'] or Decimal('0'),
+                'branch_id': branch_id,
+                'branch_name': branch_data[branch_id]['branch_name'],
+                'total_sales': branch_data[branch_id]['total_sales'],
+                'total_units': branch_data[branch_id]['total_units'],
             })
     elif group_by == 'product':
-        grouped = sale_items.values('product_id', 'product__name').annotate(
-            total_sales=Sum('subtotal'),
-            total_units=Sum('quantity')
-        ).order_by('-total_sales')
-        for row in grouped:
+        # Group by product and convert ZIG amounts
+        from collections import defaultdict
+        product_data = defaultdict(lambda: {'total_sales': Decimal('0'), 'total_units': Decimal('0'), 'product_name': ''})
+        for item in sale_items:
+            product_id = item.product_id
+            product_name = item.product.name if item.product else ''
+            payment_method = item.sale.type_of_payment
+            item_sales = sales_services.convert_zig_to_usd(item.subtotal, payment_method)
+            product_data[product_id]['total_sales'] += item_sales
+            product_data[product_id]['total_units'] += item.quantity
+            product_data[product_id]['product_name'] = product_name
+        
+        # Sort by total_sales descending
+        sorted_products = sorted(product_data.items(), key=lambda x: x[1]['total_sales'], reverse=True)
+        for product_id, data in sorted_products:
             breakdown.append({
-                'product_id': row['product_id'],
-                'product_name': row['product__name'],
-                'total_sales': row['total_sales'] or Decimal('0'),
-                'total_units': row['total_units'] or Decimal('0'),
+                'product_id': product_id,
+                'product_name': data['product_name'],
+                'total_sales': data['total_sales'],
+                'total_units': data['total_units'],
             })
     else:  # day
-        grouped = sale_items.annotate(period=TruncDate('sale__created_at')).values('period').annotate(
-            total_sales=Sum('subtotal'),
-            total_units=Sum('quantity')
-        ).order_by('period')
-        for row in grouped:
+        # Group by day and convert ZIG amounts
+        from collections import defaultdict
+        day_data = defaultdict(lambda: {'total_sales': Decimal('0'), 'total_units': Decimal('0')})
+        for item in sale_items:
+            period_key = item.sale.created_at.date().isoformat()
+            payment_method = item.sale.type_of_payment
+            item_sales = sales_services.convert_zig_to_usd(item.subtotal, payment_method)
+            day_data[period_key]['total_sales'] += item_sales
+            day_data[period_key]['total_units'] += item.quantity
+        
+        for period_key in sorted(day_data.keys()):
             breakdown.append({
-                'label': row['period'].strftime('%Y-%m-%d'),
-                'total_sales': row['total_sales'] or Decimal('0'),
-                'total_units': row['total_units'] or Decimal('0'),
+                'label': period_key,
+                'total_sales': day_data[period_key]['total_sales'],
+                'total_units': day_data[period_key]['total_units'],
             })
 
     return {

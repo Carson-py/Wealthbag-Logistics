@@ -25,6 +25,8 @@ class Unit(models.Model):
 class Product(models.Model):
     sku = models.CharField(max_length=128, unique=True, verbose_name='SKU')
     name = models.CharField(max_length=255)
+    description = models.TextField(null=True, blank=True)
+    image = models.ImageField(null=True, blank=True, upload_to = 'product_images')
     category = models.ForeignKey(Category, null=True, blank=True, on_delete=models.SET_NULL)
     unit = models.ForeignKey(Unit, null=True, blank=True, on_delete=models.SET_NULL)
     is_active = models.BooleanField(default=True)
@@ -32,8 +34,7 @@ class Product(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     
     def __str__(self):
-        return self.name
-    
+        return f"{self.name}"   
     @property
     def primary_barcode(self):
         """Get the primary barcode for this product"""
@@ -107,3 +108,5 @@ class Barcode(models.Model):
             if default_storage.exists(self.barcode_image.name):
                 default_storage.delete(self.barcode_image.name)
         super().delete(*args, **kwargs)
+
+        

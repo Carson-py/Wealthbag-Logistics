@@ -12,6 +12,7 @@ from accounts.models import User, Employee, AuditLog
 from organization.models import Branch, Warehouse
 from products.models import Product, Category
 from sales.models import Sale, SaleItem, ProductReturn
+from sales import services as sales_services
 from stock.models import BranchStock, StockEntry, StockTransfer, StockTransferItem, StockAdjustment, Supplier
 
 # Constants
@@ -79,11 +80,11 @@ def get_admin_dashboard_data(dead_stock_period: str = '90d', slow_stock_period: 
     thirty_days_ago = now - timedelta(days=30)
     ninety_days_ago = now - timedelta(days=90)
     
-    # Calculate return rate for last 30 days
+    # Calculate return rate for last 30 days (with multi-currency support)
     completed_sales_30d = Sale.objects.filter(
         status='completed',
         created_at__gte=thirty_days_ago
-    )
+    ).select_related()
     
     total_sold_quantity_30d = SaleItem.objects.filter(
         sale__in=completed_sales_30d
@@ -93,19 +94,24 @@ def get_admin_dashboard_data(dead_stock_period: str = '90d', slow_stock_period: 
         created_at__gte=thirty_days_ago
     ).aggregate(total=Sum('quantity'))['total'] or Decimal('0')
     
-    total_sales_amount_30d = completed_sales_30d.aggregate(
-        total=Sum('total_amount')
-    )['total'] or Decimal('0')
+    # Convert sales amounts to USD
+    total_sales_amount_30d = Decimal('0')
+    for sale in completed_sales_30d:
+        sale_amount_usd = sales_services.convert_zig_to_usd(sale.total_amount, sale.type_of_payment)
+        total_sales_amount_30d += sale_amount_usd
     
-    total_refund_amount_30d = ProductReturn.objects.filter(
-        created_at__gte=thirty_days_ago
-    ).aggregate(total=Sum('refund_amount'))['total'] or Decimal('0')
+    # Convert refund amounts to USD (need to get related sales)
+    total_refund_amount_30d = Decimal('0')
+    returns_30d = ProductReturn.objects.filter(created_at__gte=thirty_days_ago).select_related('sale')
+    for return_item in returns_30d:
+        refund_usd = sales_services.convert_zig_to_usd(return_item.refund_amount, return_item.sale.type_of_payment)
+        total_refund_amount_30d += refund_usd
     
-    # Calculate return rate for last 90 days
+    # Calculate return rate for last 90 days (with multi-currency support)
     completed_sales_90d = Sale.objects.filter(
         status='completed',
         created_at__gte=ninety_days_ago
-    )
+    ).select_related()
     
     total_sold_quantity_90d = SaleItem.objects.filter(
         sale__in=completed_sales_90d
@@ -115,13 +121,18 @@ def get_admin_dashboard_data(dead_stock_period: str = '90d', slow_stock_period: 
         created_at__gte=ninety_days_ago
     ).aggregate(total=Sum('quantity'))['total'] or Decimal('0')
     
-    total_sales_amount_90d = completed_sales_90d.aggregate(
-        total=Sum('total_amount')
-    )['total'] or Decimal('0')
+    # Convert sales amounts to USD
+    total_sales_amount_90d = Decimal('0')
+    for sale in completed_sales_90d:
+        sale_amount_usd = sales_services.convert_zig_to_usd(sale.total_amount, sale.type_of_payment)
+        total_sales_amount_90d += sale_amount_usd
     
-    total_refund_amount_90d = ProductReturn.objects.filter(
-        created_at__gte=ninety_days_ago
-    ).aggregate(total=Sum('refund_amount'))['total'] or Decimal('0')
+    # Convert refund amounts to USD
+    total_refund_amount_90d = Decimal('0')
+    returns_90d = ProductReturn.objects.filter(created_at__gte=ninety_days_ago).select_related('sale')
+    for return_item in returns_90d:
+        refund_usd = sales_services.convert_zig_to_usd(return_item.refund_amount, return_item.sale.type_of_payment)
+        total_refund_amount_90d += refund_usd
     
     # Calculate return rates (percentage)
     quantity_return_rate_30d = (
@@ -144,25 +155,44 @@ def get_admin_dashboard_data(dead_stock_period: str = '90d', slow_stock_period: 
         if total_sales_amount_90d > 0 else Decimal('0')
     )
     
-    # Get top returned products (last 30 days)
-    top_returned_products = ProductReturn.objects.filter(
+    # Get top returned products (last 30 days) - with multi-currency support
+    returns_30d_for_products = ProductReturn.objects.filter(
         created_at__gte=thirty_days_ago
-    ).values('product__id', 'product__name', 'product__sku').annotate(
-        return_count=Count('id'),
-        total_returned_quantity=Sum('quantity'),
-        total_refund_amount=Sum('refund_amount')
-    ).order_by('-total_returned_quantity')[:10]
+    ).select_related('sale', 'product')
     
+    # Aggregate by product with currency conversion
+    product_returns_data = defaultdict(lambda: {
+        'product_id': None,
+        'product_name': None,
+        'product_sku': None,
+        'return_count': 0,
+        'total_returned_quantity': Decimal('0'),
+        'total_refund_amount_usd': Decimal('0'),
+    })
+    
+    for return_item in returns_30d_for_products:
+        product_id = return_item.product.id
+        product_returns_data[product_id]['product_id'] = product_id
+        product_returns_data[product_id]['product_name'] = return_item.product.name
+        product_returns_data[product_id]['product_sku'] = return_item.product.sku
+        product_returns_data[product_id]['return_count'] += 1
+        product_returns_data[product_id]['total_returned_quantity'] += return_item.quantity
+        
+        # Convert refund amount to USD
+        refund_usd = sales_services.convert_zig_to_usd(return_item.refund_amount, return_item.sale.type_of_payment)
+        product_returns_data[product_id]['total_refund_amount_usd'] += refund_usd
+    
+    # Sort by total returned quantity and take top 10
     top_returned_products_list = [
         {
-            'product_id': item['product__id'],
-            'product_name': item['product__name'],
-            'product_sku': item['product__sku'],
-            'return_count': item['return_count'],
-            'total_returned_quantity': float(item['total_returned_quantity']),
-            'total_refund_amount': float(item['total_refund_amount']),
+            'product_id': data['product_id'],
+            'product_name': data['product_name'],
+            'product_sku': data['product_sku'],
+            'return_count': data['return_count'],
+            'total_returned_quantity': float(data['total_returned_quantity']),
+            'total_refund_amount': float(data['total_refund_amount_usd']),  # Converted to USD
         }
-        for item in top_returned_products
+        for data in sorted(product_returns_data.values(), key=lambda x: x['total_returned_quantity'], reverse=True)[:10]
     ]
 
     return {
@@ -424,8 +454,18 @@ def resolve_date_range(range_key: str, start_str: str = None, end_str: str = Non
     return start, end
 
 
+def _convert_sale_revenue_to_usd(sale: Sale, revenue_amount: Decimal) -> Decimal:
+    """Convert sale revenue to USD if payment method is ZIG."""
+    return sales_services.convert_zig_to_usd(revenue_amount, sale.type_of_payment)
+
+
+def _convert_saleitem_revenue_to_usd(sale_item: SaleItem, revenue_amount: Decimal) -> Decimal:
+    """Convert sale item revenue to USD if payment method is ZIG."""
+    return sales_services.convert_zig_to_usd(revenue_amount, sale_item.sale.type_of_payment)
+
+
 def get_revenue_trends_data() -> Dict:
-    """Get revenue trend data for reports."""
+    """Get revenue trend data for reports with multi-currency support."""
     now = timezone.now()
     thirty_days_ago = now - timedelta(days=30)
     ninety_days_ago = now - timedelta(days=90)
@@ -437,127 +477,308 @@ def get_revenue_trends_data() -> Dict:
         output_field=DecimalField(max_digits=14, decimal_places=2),
     )
 
-    # Daily revenue (last 30 days)
-    daily_revenue = list(
+    # Helper function to determine currency from payment method
+    def get_currency(payment_method: str) -> str:
+        """Return 'USD' or 'ZIG' based on payment method."""
+        return 'ZIG' if sales_services.is_zig_payment_method(payment_method) else 'USD'
+
+    # Daily revenue (last 30 days) - grouped by currency
+    daily_revenue_by_currency = list(
         Sale.objects.filter(created_at__gte=thirty_days_ago)
         .annotate(day=TruncDate('created_at'))
-        .values('day')
+        .values('day', 'type_of_payment')
         .annotate(revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')))
-        .order_by('day')
+        .order_by('day', 'type_of_payment')
     )
+    
+    # Organize daily revenue by currency
+    daily_revenue_usd = {}
+    daily_revenue_zig = {}
+    daily_revenue_combined = {}  # Combined with ZIG converted to USD
+    
+    for entry in daily_revenue_by_currency:
+        day = entry['day']
+        currency = get_currency(entry['type_of_payment'])
+        revenue = entry['revenue']
+        
+        if currency == 'USD':
+            daily_revenue_usd[day] = daily_revenue_usd.get(day, Decimal('0')) + revenue
+            daily_revenue_combined[day] = daily_revenue_combined.get(day, Decimal('0')) + revenue
+        else:  # ZIG
+            daily_revenue_zig[day] = daily_revenue_zig.get(day, Decimal('0')) + revenue
+            # Convert ZIG to USD for combined view
+            revenue_usd = sales_services.convert_zig_to_usd(revenue, entry['type_of_payment'])
+            daily_revenue_combined[day] = daily_revenue_combined.get(day, Decimal('0')) + revenue_usd
+    
+    # Convert to list format
+    daily_revenue_usd_list = [{'day': day, 'revenue': revenue} for day, revenue in sorted(daily_revenue_usd.items())]
+    daily_revenue_zig_list = [{'day': day, 'revenue': revenue} for day, revenue in sorted(daily_revenue_zig.items())]
+    daily_revenue_combined_list = [{'day': day, 'revenue': revenue} for day, revenue in sorted(daily_revenue_combined.items())]
 
-    # Weekly revenue (last 12 weeks)
-    weekly_revenue = list(
+    # Weekly revenue (last 12 weeks) - grouped by currency
+    weekly_revenue_by_currency = list(
         Sale.objects.filter(created_at__gte=now - timedelta(weeks=12))
         .annotate(week=TruncWeek('created_at'))
-        .values('week')
+        .values('week', 'type_of_payment')
         .annotate(revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')))
-        .order_by('week')
+        .order_by('week', 'type_of_payment')
     )
+    
+    # Organize weekly revenue by currency
+    weekly_revenue_usd = {}
+    weekly_revenue_zig = {}
+    weekly_revenue_combined = {}
+    
+    for entry in weekly_revenue_by_currency:
+        week = entry['week']
+        currency = get_currency(entry['type_of_payment'])
+        revenue = entry['revenue']
+        
+        if currency == 'USD':
+            weekly_revenue_usd[week] = weekly_revenue_usd.get(week, Decimal('0')) + revenue
+            weekly_revenue_combined[week] = weekly_revenue_combined.get(week, Decimal('0')) + revenue
+        else:  # ZIG
+            weekly_revenue_zig[week] = weekly_revenue_zig.get(week, Decimal('0')) + revenue
+            revenue_usd = sales_services.convert_zig_to_usd(revenue, entry['type_of_payment'])
+            weekly_revenue_combined[week] = weekly_revenue_combined.get(week, Decimal('0')) + revenue_usd
+    
+    weekly_revenue_usd_list = [{'week': week, 'revenue': revenue} for week, revenue in sorted(weekly_revenue_usd.items())]
+    weekly_revenue_zig_list = [{'week': week, 'revenue': revenue} for week, revenue in sorted(weekly_revenue_zig.items())]
+    weekly_revenue_combined_list = [{'week': week, 'revenue': revenue} for week, revenue in sorted(weekly_revenue_combined.items())]
 
-    # Monthly revenue (current year)
-    monthly_revenue = list(
+    # Monthly revenue (current year) - grouped by currency
+    monthly_revenue_by_currency = list(
         Sale.objects.filter(created_at__year=current_year)
         .annotate(month=TruncMonth('created_at'))
-        .values('month')
+        .values('month', 'type_of_payment')
         .annotate(revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')))
-        .order_by('month')
+        .order_by('month', 'type_of_payment')
     )
+    
+    # Organize monthly revenue by currency
+    monthly_revenue_usd = {}
+    monthly_revenue_zig = {}
+    monthly_revenue_combined = {}
+    
+    for entry in monthly_revenue_by_currency:
+        month = entry['month']
+        currency = get_currency(entry['type_of_payment'])
+        revenue = entry['revenue']
+        
+        if currency == 'USD':
+            monthly_revenue_usd[month] = monthly_revenue_usd.get(month, Decimal('0')) + revenue
+            monthly_revenue_combined[month] = monthly_revenue_combined.get(month, Decimal('0')) + revenue
+        else:  # ZIG
+            monthly_revenue_zig[month] = monthly_revenue_zig.get(month, Decimal('0')) + revenue
+            revenue_usd = sales_services.convert_zig_to_usd(revenue, entry['type_of_payment'])
+            monthly_revenue_combined[month] = monthly_revenue_combined.get(month, Decimal('0')) + revenue_usd
+    
+    monthly_revenue_usd_list = [{'month': month, 'revenue': revenue} for month, revenue in sorted(monthly_revenue_usd.items())]
+    monthly_revenue_zig_list = [{'month': month, 'revenue': revenue} for month, revenue in sorted(monthly_revenue_zig.items())]
+    monthly_revenue_combined_list = [{'month': month, 'revenue': revenue} for month, revenue in sorted(monthly_revenue_combined.items())]
 
-    # Year-over-year comparison
-    yoy_current = {entry['month'].month: entry['revenue'] for entry in monthly_revenue}
-    yoy_previous = {
-        entry['month'].month: entry['revenue']
-        for entry in Sale.objects.filter(created_at__year=previous_year)
+    # Year-over-year comparison - grouped by currency
+    yoy_current_usd = {}
+    yoy_current_zig = {}
+    yoy_current_combined = {}
+    
+    for entry in monthly_revenue_by_currency:
+        month_num = entry['month'].month
+        currency = get_currency(entry['type_of_payment'])
+        revenue = entry['revenue']
+        
+        if currency == 'USD':
+            yoy_current_usd[month_num] = yoy_current_usd.get(month_num, Decimal('0')) + revenue
+            yoy_current_combined[month_num] = yoy_current_combined.get(month_num, Decimal('0')) + revenue
+        else:  # ZIG
+            yoy_current_zig[month_num] = yoy_current_zig.get(month_num, Decimal('0')) + revenue
+            revenue_usd = sales_services.convert_zig_to_usd(revenue, entry['type_of_payment'])
+            yoy_current_combined[month_num] = yoy_current_combined.get(month_num, Decimal('0')) + revenue_usd
+    
+    # Previous year data
+    yoy_previous_by_currency = list(
+        Sale.objects.filter(created_at__year=previous_year)
         .annotate(month=TruncMonth('created_at'))
-        .values('month')
+        .values('month', 'type_of_payment')
         .annotate(revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')))
-    }
-    yoy_series = []
+    )
+    
+    yoy_previous_usd = {}
+    yoy_previous_zig = {}
+    yoy_previous_combined = {}
+    
+    for entry in yoy_previous_by_currency:
+        month_num = entry['month'].month
+        currency = get_currency(entry['type_of_payment'])
+        revenue = entry['revenue']
+        
+        if currency == 'USD':
+            yoy_previous_usd[month_num] = yoy_previous_usd.get(month_num, Decimal('0')) + revenue
+            yoy_previous_combined[month_num] = yoy_previous_combined.get(month_num, Decimal('0')) + revenue
+        else:  # ZIG
+            yoy_previous_zig[month_num] = yoy_previous_zig.get(month_num, Decimal('0')) + revenue
+            revenue_usd = sales_services.convert_zig_to_usd(revenue, entry['type_of_payment'])
+            yoy_previous_combined[month_num] = yoy_previous_combined.get(month_num, Decimal('0')) + revenue_usd
+    
+    # Create year-over-year series for each currency
+    yoy_series_usd = []
+    yoy_series_zig = []
+    yoy_series_combined = []
+    
     for month in range(1, 13):
-        yoy_series.append({
+        yoy_series_usd.append({
             'month': month,
             'month_label': month_abbr[month],
-            'current_year': yoy_current.get(month, Decimal('0')),
-            'previous_year': yoy_previous.get(month, Decimal('0')),
+            'current_year': yoy_current_usd.get(month, Decimal('0')),
+            'previous_year': yoy_previous_usd.get(month, Decimal('0')),
+        })
+        yoy_series_zig.append({
+            'month': month,
+            'month_label': month_abbr[month],
+            'current_year': yoy_current_zig.get(month, Decimal('0')),
+            'previous_year': yoy_previous_zig.get(month, Decimal('0')),
+        })
+        yoy_series_combined.append({
+            'month': month,
+            'month_label': month_abbr[month],
+            'current_year': yoy_current_combined.get(month, Decimal('0')),
+            'previous_year': yoy_previous_combined.get(month, Decimal('0')),
         })
 
     return {
-        'daily_revenue_trend': daily_revenue,
-        'weekly_revenue_trend': weekly_revenue,
-        'monthly_revenue_trend': monthly_revenue,
-        'year_over_year_revenue': yoy_series,
+        # Combined view (ZIG converted to USD)
+        'daily_revenue_trend': daily_revenue_combined_list,
+        'weekly_revenue_trend': weekly_revenue_combined_list,
+        'monthly_revenue_trend': monthly_revenue_combined_list,
+        'year_over_year_revenue': yoy_series_combined,
+        # USD only
+        'daily_revenue_trend_usd': daily_revenue_usd_list,
+        'weekly_revenue_trend_usd': weekly_revenue_usd_list,
+        'monthly_revenue_trend_usd': monthly_revenue_usd_list,
+        'year_over_year_revenue_usd': yoy_series_usd,
+        # ZIG only
+        'daily_revenue_trend_zig': daily_revenue_zig_list,
+        'weekly_revenue_trend_zig': weekly_revenue_zig_list,
+        'monthly_revenue_trend_zig': monthly_revenue_zig_list,
+        'year_over_year_revenue_zig': yoy_series_zig,
     }
 
 
 def get_category_revenue_data() -> List[Dict]:
-    """Get category-wise revenue data."""
+    """Get category-wise revenue data with multi-currency support."""
     current_year = timezone.now().year
     
-    category_revenue_queryset = (
-        SaleItem.objects.filter(sale__created_at__year=current_year)
-        .values('product__category__id', 'product__category__name')
-        .annotate(revenue=Coalesce(Sum('subtotal'), Decimal('0')))
-        .order_by('-revenue')
-    )
+    # Get sale items with their sales for currency conversion
+    sale_items = SaleItem.objects.filter(
+        sale__created_at__year=current_year
+    ).select_related('sale', 'product', 'product__category')
     
-    return [
-        {
-            'category_id': entry['product__category__id'],
-            'category_name': entry['product__category__name'] or 'Uncategorized',
-            'revenue': entry['revenue'],
-        }
-        for entry in category_revenue_queryset
-    ]
+    # Aggregate by category, converting ZIG to USD
+    category_revenue = defaultdict(lambda: {'revenue_usd': Decimal('0'), 'revenue_zig': Decimal('0')})
+    
+    for item in sale_items:
+        category_id = item.product.category.id if item.product.category else None
+        category_name = item.product.category.name if item.product.category else 'Uncategorized'
+        key = (category_id, category_name)
+        
+        revenue = item.subtotal
+        if sales_services.is_zig_payment_method(item.sale.type_of_payment):
+            category_revenue[key]['revenue_zig'] += revenue
+            revenue_usd = sales_services.convert_zig_to_usd(revenue, item.sale.type_of_payment)
+            category_revenue[key]['revenue_usd'] += revenue_usd
+        else:
+            category_revenue[key]['revenue_usd'] += revenue
+    
+    # Convert to list format
+    result = []
+    for (category_id, category_name), revenues in category_revenue.items():
+        result.append({
+            'category_id': category_id,
+            'category_name': category_name,
+            'revenue': revenues['revenue_usd'],  # Combined revenue in USD
+            'revenue_usd': revenues['revenue_usd'],
+            'revenue_zig': revenues['revenue_zig'],
+        })
+    
+    return sorted(result, key=lambda x: x['revenue'], reverse=True)
 
 
 def get_top_products_data() -> Dict:
-    """Get top revenue-generating products with trends."""
+    """Get top revenue-generating products with trends (multi-currency support)."""
     now = timezone.now()
     ninety_days_ago = now - timedelta(days=90)
     
-    top_products_queryset = (
-        SaleItem.objects.filter(sale__created_at__gte=ninety_days_ago)
-        .values('product_id', 'product__name', 'product__sku')
-        .annotate(revenue=Coalesce(Sum('subtotal'), Decimal('0')))
-        .order_by('-revenue')[:5]
-    )
+    # Get sale items with sales for currency conversion
+    sale_items = SaleItem.objects.filter(
+        sale__created_at__gte=ninety_days_ago
+    ).select_related('sale', 'product')
     
-    top_products = [
-        {
-            'product_id': entry['product_id'],
-            'product_name': entry['product__name'],
-            'product_sku': entry['product__sku'],
-            'revenue': entry['revenue'],
-        }
-        for entry in top_products_queryset
-    ]
+    # Aggregate revenue by product, converting ZIG to USD
+    product_revenue = defaultdict(lambda: {'revenue_usd': Decimal('0'), 'revenue_zig': Decimal('0')})
     
-    top_product_ids = [product['product_id'] for product in top_products]
+    for item in sale_items:
+        product_id = item.product_id
+        revenue = item.subtotal
+        
+        if sales_services.is_zig_payment_method(item.sale.type_of_payment):
+            product_revenue[product_id]['revenue_zig'] += revenue
+            revenue_usd = sales_services.convert_zig_to_usd(revenue, item.sale.type_of_payment)
+            product_revenue[product_id]['revenue_usd'] += revenue_usd
+        else:
+            product_revenue[product_id]['revenue_usd'] += revenue
     
-    product_trends = defaultdict(list)
+    # Get top 5 products by combined revenue (USD)
+    top_product_data = []
+    for product_id, revenues in sorted(product_revenue.items(), key=lambda x: x[1]['revenue_usd'], reverse=True)[:5]:
+        product = Product.objects.get(pk=product_id)
+        top_product_data.append({
+            'product_id': product_id,
+            'product_name': product.name,
+            'product_sku': product.sku,
+            'revenue': revenues['revenue_usd'],  # Combined revenue in USD
+            'revenue_usd': revenues['revenue_usd'],
+            'revenue_zig': revenues['revenue_zig'],
+        })
+    
+    top_product_ids = [p['product_id'] for p in top_product_data]
+    
+    # Get daily trends for top products
+    product_trends = defaultdict(lambda: {'usd': defaultdict(lambda: Decimal('0')), 'zig': defaultdict(lambda: Decimal('0'))})
+    
     if top_product_ids:
-        product_daily = (
-            SaleItem.objects.filter(
+        trend_items = SaleItem.objects.filter(
                 product_id__in=top_product_ids,
                 sale__created_at__gte=ninety_days_ago,
-            )
-            .annotate(day=TruncDate('sale__created_at'))
-            .values('product_id', 'product__name', 'day')
-            .annotate(revenue=Coalesce(Sum('subtotal'), Decimal('0')))
-            .order_by('product_id', 'day')
-        )
-
-        for entry in product_daily:
-            product_trends[entry['product_id']].append({
-                'day': entry['day'],
-                'revenue': entry['revenue'],
+        ).select_related('sale', 'product')
+        
+        for item in trend_items:
+            day = item.sale.created_at.date()
+            revenue = item.subtotal
+            
+            if sales_services.is_zig_payment_method(item.sale.type_of_payment):
+                product_trends[item.product_id]['zig'][day] += revenue
+                revenue_usd = sales_services.convert_zig_to_usd(revenue, item.sale.type_of_payment)
+                product_trends[item.product_id]['usd'][day] += revenue_usd
+            else:
+                product_trends[item.product_id]['usd'][day] += revenue
+    
+    # Format trends
+    for product in top_product_data:
+        product_id = product['product_id']
+        trends = []
+        all_days = set(product_trends[product_id]['usd'].keys()) | set(product_trends[product_id]['zig'].keys())
+        
+        for day in sorted(all_days):
+            trends.append({
+                'day': day,
+                'revenue': product_trends[product_id]['usd'].get(day, Decimal('0')),  # Combined in USD
+                'revenue_usd': product_trends[product_id]['usd'].get(day, Decimal('0')),
+                'revenue_zig': product_trends[product_id]['zig'].get(day, Decimal('0')),
             })
+        
+        product['trend'] = trends
 
-    for product in top_products:
-        product['trend'] = product_trends.get(product['product_id'], [])
-
-    return {'top_products': top_products}
+    return {'top_products': top_product_data}
 
 
 def get_fast_moving_products(
@@ -565,33 +786,55 @@ def get_fast_moving_products(
     limit: int = 10,
     branch_id: Optional[int] = None,
 ) -> Dict:
-    """Return fast-moving products based on quantity sold within the given window."""
+    """Return fast-moving products based on quantity sold within the given window (multi-currency support)."""
     now = timezone.now()
     start = now - timedelta(days=days)
 
-    sale_items = SaleItem.objects.filter(sale__created_at__gte=start)
+    sale_items = SaleItem.objects.filter(sale__created_at__gte=start).select_related('sale', 'product')
     if branch_id:
         sale_items = sale_items.filter(sale__branch_id=branch_id)
 
-    fast_queryset = (
-        sale_items
-        .values('product_id', 'product__name', 'product__sku')
-        .annotate(
-            quantity_sold=Coalesce(Sum('quantity'), Decimal('0')),
-            revenue=Coalesce(Sum('subtotal'), Decimal('0')),
-        )
-        .order_by('-quantity_sold')[:limit]
-    )
+    # Aggregate by product with currency conversion
+    product_data = defaultdict(lambda: {
+        'quantity_sold': Decimal('0'),
+        'revenue_usd': Decimal('0'),
+        'revenue_zig': Decimal('0'),
+        'product_name': None,
+        'product_sku': None,
+    })
+
+    for item in sale_items:
+        product_id = item.product_id
+        product_data[product_id]['quantity_sold'] += item.quantity
+        product_data[product_id]['product_name'] = item.product.name
+        product_data[product_id]['product_sku'] = item.product.sku
+        
+        revenue = item.subtotal
+        if sales_services.is_zig_payment_method(item.sale.type_of_payment):
+            product_data[product_id]['revenue_zig'] += revenue
+            revenue_usd = sales_services.convert_zig_to_usd(revenue, item.sale.type_of_payment)
+            product_data[product_id]['revenue_usd'] += revenue_usd
+        else:
+            product_data[product_id]['revenue_usd'] += revenue
+
+    # Sort by quantity sold and take top limit
+    sorted_products = sorted(
+        product_data.items(),
+        key=lambda x: x[1]['quantity_sold'],
+        reverse=True
+    )[:limit]
 
     items = [
         {
-            'product_id': entry['product_id'],
-            'product_name': entry['product__name'],
-            'product_sku': entry['product__sku'],
-            'quantity_sold': entry['quantity_sold'],
-            'revenue': entry['revenue'],
+            'product_id': product_id,
+            'product_name': data['product_name'],
+            'product_sku': data['product_sku'],
+            'quantity_sold': data['quantity_sold'],
+            'revenue': data['revenue_usd'],  # Combined revenue in USD
+            'revenue_usd': data['revenue_usd'],
+            'revenue_zig': data['revenue_zig'],
         }
-        for entry in fast_queryset
+        for product_id, data in sorted_products
     ]
 
     return {
@@ -602,46 +845,77 @@ def get_fast_moving_products(
 
 
 def get_branch_warehouse_revenue_data() -> Dict:
-    """Get branch and warehouse revenue trends."""
+    """Get branch and warehouse revenue trends with multi-currency support."""
     now = timezone.now()
     thirty_days_ago = now - timedelta(days=30)
     
-    net_revenue_expr = ExpressionWrapper(
-        F('total_amount') - F('discount') + F('tax'),
-        output_field=DecimalField(max_digits=14, decimal_places=2),
-    )
+    # Get sales with related data
+    sales = Sale.objects.filter(created_at__gte=thirty_days_ago).select_related('branch', 'branch__warehouse')
     
-    branch_revenue_queryset = (
-        Sale.objects.filter(created_at__gte=thirty_days_ago)
-        .values('branch__id', 'branch__name')
-        .annotate(revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')))
-        .order_by('-revenue')
-    )
+    # Aggregate branch revenue
+    branch_revenue_data = defaultdict(lambda: {
+        'revenue_usd': Decimal('0'),
+        'revenue_zig': Decimal('0'),
+        'branch_name': None,
+    })
     
+    # Aggregate warehouse revenue
+    warehouse_revenue_data = defaultdict(lambda: {
+        'revenue_usd': Decimal('0'),
+        'revenue_zig': Decimal('0'),
+        'warehouse_name': None,
+    })
+    
+    for sale in sales:
+        net_revenue = sale.total_amount - sale.discount + sale.tax
+        
+        # Branch revenue
+        if sale.branch:
+            branch_id = sale.branch.id
+            branch_revenue_data[branch_id]['branch_name'] = sale.branch.name
+            
+            if sales_services.is_zig_payment_method(sale.type_of_payment):
+                branch_revenue_data[branch_id]['revenue_zig'] += net_revenue
+                revenue_usd = sales_services.convert_zig_to_usd(net_revenue, sale.type_of_payment)
+                branch_revenue_data[branch_id]['revenue_usd'] += revenue_usd
+            else:
+                branch_revenue_data[branch_id]['revenue_usd'] += net_revenue
+            
+            # Warehouse revenue
+            if sale.branch.warehouse:
+                warehouse_id = sale.branch.warehouse.id
+                warehouse_revenue_data[warehouse_id]['warehouse_name'] = sale.branch.warehouse.name
+                
+                if sales_services.is_zig_payment_method(sale.type_of_payment):
+                    warehouse_revenue_data[warehouse_id]['revenue_zig'] += net_revenue
+                    revenue_usd = sales_services.convert_zig_to_usd(net_revenue, sale.type_of_payment)
+                    warehouse_revenue_data[warehouse_id]['revenue_usd'] += revenue_usd
+                else:
+                    warehouse_revenue_data[warehouse_id]['revenue_usd'] += net_revenue
+    
+    # Format branch revenue
     branch_revenue = [
         {
-            'branch_id': entry['branch__id'],
-            'branch_name': entry['branch__name'],
-            'revenue': entry['revenue'],
+            'branch_id': branch_id,
+            'branch_name': data['branch_name'],
+            'revenue': data['revenue_usd'],  # Combined revenue in USD
+            'revenue_usd': data['revenue_usd'],
+            'revenue_zig': data['revenue_zig'],
         }
-        for entry in branch_revenue_queryset
+        for branch_id, data in sorted(branch_revenue_data.items(), key=lambda x: x[1]['revenue_usd'], reverse=True)
     ]
     
-    warehouse_revenue_queryset = (
-        Sale.objects.filter(created_at__gte=thirty_days_ago)
-        .values('branch__warehouse__id', 'branch__warehouse__name')
-        .annotate(revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')))
-        .order_by('-revenue')
-    )
-    
+    # Format warehouse revenue
     warehouse_revenue = [
         {
-            'warehouse_id': entry['branch__warehouse__id'],
-            'warehouse_name': entry['branch__warehouse__name'],
-            'revenue': entry['revenue'],
+            'warehouse_id': warehouse_id,
+            'warehouse_name': data['warehouse_name'],
+            'revenue': data['revenue_usd'],  # Combined revenue in USD
+            'revenue_usd': data['revenue_usd'],
+            'revenue_zig': data['revenue_zig'],
         }
-        for entry in warehouse_revenue_queryset
-        if entry['branch__warehouse__id'] is not None  # Only include entries with warehouse
+        for warehouse_id, data in sorted(warehouse_revenue_data.items(), key=lambda x: x[1]['revenue_usd'], reverse=True)
+        if warehouse_id is not None
     ]
     
     return {
@@ -652,18 +926,8 @@ def get_branch_warehouse_revenue_data() -> Dict:
 
 def get_cashier_performance_data(range_key: str = 'month', start_str: str = None, end_str: str = None, 
                                 cashier_id: int = None, branch_id: int = None) -> Dict:
-    """Get cashier performance data with detailed metrics."""
+    """Get cashier performance data with detailed metrics (multi-currency support)."""
     start_date, end_date = resolve_date_range(range_key, start_str, end_str)
-    
-    net_revenue_expr = ExpressionWrapper(
-        F('total_amount') - F('discount') + F('tax'),
-        output_field=DecimalField(max_digits=14, decimal_places=2),
-    )
-    
-    cost_expr = ExpressionWrapper(
-        F('items__purchase_price') * F('items__quantity'),
-        output_field=DecimalField(max_digits=14, decimal_places=2),
-    )
     
     cashier_sales = (
         Sale.objects.filter(
@@ -672,6 +936,8 @@ def get_cashier_performance_data(range_key: str = 'month', start_str: str = None
             cashier__isnull=False,
             status='completed',
         )
+        .select_related('cashier')
+        .prefetch_related('items', 'returns', 'cashier__profile')
     )
     
     if cashier_id:
@@ -680,40 +946,68 @@ def get_cashier_performance_data(range_key: str = 'month', start_str: str = None
     if branch_id:
         cashier_sales = cashier_sales.filter(branch_id=branch_id)
 
-    cashier_queryset = (
-        cashier_sales.values(
-            'cashier_id',
-            'cashier__email',
-            'cashier__profile__first_name',
-            'cashier__profile__last_name',
-        )
-        .annotate(
-            total_sales=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-            total_cost=Coalesce(Sum(cost_expr), Decimal('0')),
-            transaction_count=Count('id'),
-            total_items=Coalesce(Sum('items__quantity'), Decimal('0')),
-            total_discount=Coalesce(Sum('discount'), Decimal('0')),
-            total_tax=Coalesce(Sum('tax'), Decimal('0')),
-            refund_count=Count(
-                'returns',
-                filter=Q(
-                    returns__created_at__gte=start_date,
-                    returns__created_at__lte=end_date,
-                ),
-            ),
-            void_count=Count('id', filter=Q(status='cancelled')),
-        )
-        .order_by('-total_sales')
-    )
+    # Aggregate by cashier, converting all amounts to USD
+    cashier_data = defaultdict(lambda: {
+        'cashier_id': None,
+        'cashier_email': None,
+        'cashier_name': None,
+        'total_sales_usd': Decimal('0'),
+        'total_cost_usd': Decimal('0'),
+        'total_discount_usd': Decimal('0'),
+        'total_tax_usd': Decimal('0'),
+        'transaction_count': 0,
+        'total_items': Decimal('0'),
+        'refund_count': 0,
+        'void_count': 0,
+    })
+    
+    for sale in cashier_sales:
+        cashier_id_key = sale.cashier_id
+        cashier_data[cashier_id_key]['cashier_id'] = cashier_id_key
+        cashier_data[cashier_id_key]['cashier_email'] = sale.cashier.email
+        
+        # Get employee profile (reverse ForeignKey, so use .first() or .all())
+        employee = sale.cashier.profile.first() if hasattr(sale.cashier, 'profile') else None
+        first_name = employee.first_name if employee else None
+        last_name = employee.last_name if employee else None
+        if first_name or last_name:
+            cashier_data[cashier_id_key]['cashier_name'] = f"{first_name or ''} {last_name or ''}".strip()
+        else:
+            cashier_data[cashier_id_key]['cashier_name'] = sale.cashier.email
+        
+        cashier_data[cashier_id_key]['transaction_count'] += 1
+        
+        # Convert sale amounts to USD
+        net_revenue = sale.total_amount - sale.discount + sale.tax
+        net_revenue_usd = sales_services.convert_zig_to_usd(net_revenue, sale.type_of_payment)
+        cashier_data[cashier_id_key]['total_sales_usd'] += net_revenue_usd
+        
+        discount_usd = sales_services.convert_zig_to_usd(sale.discount, sale.type_of_payment)
+        cashier_data[cashier_id_key]['total_discount_usd'] += discount_usd
+        
+        tax_usd = sales_services.convert_zig_to_usd(sale.tax, sale.type_of_payment)
+        cashier_data[cashier_id_key]['total_tax_usd'] += tax_usd
+        
+        # Convert item costs to USD
+        for item in sale.items.all():
+            cashier_data[cashier_id_key]['total_items'] += item.quantity
+            item_cost = item.purchase_price * item.quantity
+            item_cost_usd = sales_services.convert_zig_to_usd(item_cost, sale.type_of_payment)
+            cashier_data[cashier_id_key]['total_cost_usd'] += item_cost_usd
+        
+        # Count refunds and voids
+        cashier_data[cashier_id_key]['refund_count'] += sale.returns.count()
+        if sale.status == 'cancelled':
+            cashier_data[cashier_id_key]['void_count'] += 1
 
     cashier_performance = []
-    for entry in cashier_queryset:
-        transactions = entry['transaction_count'] or 0
-        total_sales = entry['total_sales'] or Decimal('0')
-        total_cost = entry['total_cost'] or Decimal('0')
-        total_items = entry['total_items'] or Decimal('0')
-        refund_count = entry['refund_count'] or 0
-        void_count = entry['void_count'] or 0
+    for cashier_id_key, data in sorted(cashier_data.items(), key=lambda x: x[1]['total_sales_usd'], reverse=True):
+        transactions = data['transaction_count']
+        total_sales = data['total_sales_usd']
+        total_cost = data['total_cost_usd']
+        total_items = data['total_items']
+        refund_count = data['refund_count']
+        void_count = data['void_count']
         total_profit = total_sales - total_cost
 
         avg_sale = total_sales / transactions if transactions else Decimal('0')
@@ -721,15 +1015,11 @@ def get_cashier_performance_data(range_key: str = 'month', start_str: str = None
         profit_margin = (total_profit / total_sales * 100) if total_sales > 0 else Decimal('0')
         items_per_transaction = total_items / transactions if transactions else Decimal('0')
 
-        first_name = entry.get('cashier__profile__first_name') or ''
-        last_name = entry.get('cashier__profile__last_name') or ''
-        full_name = f"{first_name} {last_name}".strip()
-
         cashier_performance.append({
-            'cashier_id': entry['cashier_id'],
-            'cashier_name': full_name or entry['cashier__email'],
-            'cashier_email': entry['cashier__email'],
-            'total_sales_amount': total_sales,
+            'cashier_id': data['cashier_id'],
+            'cashier_name': data['cashier_name'] or data['cashier_email'],
+            'cashier_email': data['cashier_email'],
+            'total_sales_amount': total_sales,  # Combined in USD
             'total_cost': total_cost,
             'total_profit': total_profit,
             'profit_margin_percentage': profit_margin,
@@ -737,115 +1027,104 @@ def get_cashier_performance_data(range_key: str = 'month', start_str: str = None
             'average_sale_value': avg_sale,
             'total_items_sold': total_items,
             'items_per_transaction': items_per_transaction,
-            'total_discount': entry['total_discount'] or Decimal('0'),
-            'total_tax': entry['total_tax'] or Decimal('0'),
+            'total_discount': data['total_discount_usd'],
+            'total_tax': data['total_tax_usd'],
             'refund_count': refund_count,
             'void_count': void_count,
             'refund_rate': refund_rate,
         })
 
-    # Get daily trends for cashiers
-    daily_trends = []
+    # Get daily trends for cashiers (convert to USD)
+    daily_trends_data = defaultdict(lambda: {
+        'transaction_count': 0,
+        'total_revenue_usd': Decimal('0'),
+        'total_cost_usd': Decimal('0'),
+        'total_items': Decimal('0'),
+    })
+    
+    filtered_sales = cashier_sales
     if cashier_id:
-        daily_cashier_sales = cashier_sales.filter(cashier_id=cashier_id)
-        daily_trends = list(
-            daily_cashier_sales.annotate(day=TruncDate('created_at'))
-            .values('day')
-            .annotate(
-                transaction_count=Count('id'),
-                total_revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-                total_cost=Coalesce(Sum(cost_expr), Decimal('0')),
-                total_items=Coalesce(Sum('items__quantity'), Decimal('0')),
-            )
-            .order_by('day')
-        )
-        daily_trends = [
-            {
-                'date': entry['day'],
-                'transaction_count': entry['transaction_count'],
-                'total_revenue': entry['total_revenue'],
-                'total_cost': entry['total_cost'],
-                'total_profit': entry['total_revenue'] - entry['total_cost'],
-                'total_items_sold': entry['total_items'],
-            }
-            for entry in daily_trends
-        ]
-    else:
-        # Get daily trends aggregated across all cashiers
-        daily_trends = list(
-            cashier_sales.annotate(day=TruncDate('created_at'))
-            .values('day')
-            .annotate(
-                transaction_count=Count('id'),
-                total_revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-                total_cost=Coalesce(Sum(cost_expr), Decimal('0')),
-                total_items=Coalesce(Sum('items__quantity'), Decimal('0')),
-            )
-            .order_by('day')
-        )
-        daily_trends = [
-            {
-                'date': entry['day'],
-                'transaction_count': entry['transaction_count'],
-                'total_revenue': entry['total_revenue'],
-                'total_cost': entry['total_cost'],
-                'total_profit': entry['total_revenue'] - entry['total_cost'],
-                'total_items_sold': entry['total_items'],
-            }
-            for entry in daily_trends
-        ]
+        filtered_sales = filtered_sales.filter(cashier_id=cashier_id)
+    
+    for sale in filtered_sales.select_related('branch').prefetch_related('items'):
+        day = sale.created_at.date()
+        daily_trends_data[day]['transaction_count'] += 1
+        
+        net_revenue = sale.total_amount - sale.discount + sale.tax
+        net_revenue_usd = sales_services.convert_zig_to_usd(net_revenue, sale.type_of_payment)
+        daily_trends_data[day]['total_revenue_usd'] += net_revenue_usd
+        
+        for item in sale.items.all():
+            daily_trends_data[day]['total_items'] += item.quantity
+            item_cost = item.purchase_price * item.quantity
+            item_cost_usd = sales_services.convert_zig_to_usd(item_cost, sale.type_of_payment)
+            daily_trends_data[day]['total_cost_usd'] += item_cost_usd
+    
+    # Format daily trends (moved outside the loop)
+    daily_trends = [
+        {
+            'date': day,
+            'transaction_count': data['transaction_count'],
+            'total_revenue': data['total_revenue_usd'],  # Combined in USD
+            'total_cost': data['total_cost_usd'],
+            'total_profit': data['total_revenue_usd'] - data['total_cost_usd'],
+            'total_items_sold': data['total_items'],
+        }
+        for day, data in sorted(daily_trends_data.items())
+    ]
 
-    # Get payment method breakdown
-    payment_method_breakdown = []
-    if cashier_id:
-        payment_method_data = list(
-            cashier_sales.filter(cashier_id=cashier_id)
-            .values('type_of_payment')
-            .annotate(
-                transaction_count=Count('id'),
-                total_revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-            )
-            .order_by('-total_revenue')
-        )
-    else:
-        payment_method_data = list(
-            cashier_sales.values('type_of_payment')
-            .annotate(
-                transaction_count=Count('id'),
-                total_revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-            )
-            .order_by('-total_revenue')
-        )
+    # Get payment method breakdown (convert to USD)
+    payment_method_data_dict = defaultdict(lambda: {
+        'transaction_count': 0,
+        'total_revenue_usd': Decimal('0'),
+    })
+    
+    for sale in filtered_sales:
+        payment_method = sale.type_of_payment
+        payment_method_data_dict[payment_method]['transaction_count'] += 1
+        
+        net_revenue = sale.total_amount - sale.discount + sale.tax
+        net_revenue_usd = sales_services.convert_zig_to_usd(net_revenue, sale.type_of_payment)
+        payment_method_data_dict[payment_method]['total_revenue_usd'] += net_revenue_usd
     
     payment_method_breakdown = [
         {
-            'payment_method': entry['type_of_payment'],
-            'transaction_count': entry['transaction_count'],
-            'total_revenue': entry['total_revenue'],
+            'payment_method': method,
+            'transaction_count': data['transaction_count'],
+            'total_revenue': data['total_revenue_usd'],  # Combined in USD
         }
-        for entry in payment_method_data
+        for method, data in sorted(payment_method_data_dict.items(), key=lambda x: x[1]['total_revenue_usd'], reverse=True)
     ]
 
     # Get branch performance breakdown (if not filtering by branch)
     branch_breakdown = []
     if not branch_id and cashier_id:
-        branch_data = list(
-            cashier_sales.filter(cashier_id=cashier_id)
-            .values('branch_id', 'branch__name')
-            .annotate(
-                transaction_count=Count('id'),
-                total_revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-            )
-            .order_by('-total_revenue')
-        )
+        branch_data_dict = defaultdict(lambda: {
+            'branch_id': None,
+            'branch_name': None,
+            'transaction_count': 0,
+            'total_revenue_usd': Decimal('0'),
+        })
+        
+        for sale in filtered_sales.select_related('branch'):
+            if sale.branch:
+                branch_id_key = sale.branch.id
+                branch_data_dict[branch_id_key]['branch_id'] = branch_id_key
+                branch_data_dict[branch_id_key]['branch_name'] = sale.branch.name
+                branch_data_dict[branch_id_key]['transaction_count'] += 1
+                
+                net_revenue = sale.total_amount - sale.discount + sale.tax
+                net_revenue_usd = sales_services.convert_zig_to_usd(net_revenue, sale.type_of_payment)
+                branch_data_dict[branch_id_key]['total_revenue_usd'] += net_revenue_usd
+        
         branch_breakdown = [
             {
-                'branch_id': entry['branch_id'],
-                'branch_name': entry['branch__name'],
-                'transaction_count': entry['transaction_count'],
-                'total_revenue': entry['total_revenue'],
+                'branch_id': data['branch_id'],
+                'branch_name': data['branch_name'],
+                'transaction_count': data['transaction_count'],
+                'total_revenue': data['total_revenue_usd'],  # Combined in USD
             }
-            for entry in branch_data
+            for data in sorted(branch_data_dict.values(), key=lambda x: x['total_revenue_usd'], reverse=True)
         ]
 
     return {
@@ -1708,7 +1987,7 @@ def get_branch_stock_evaluation(branch: Branch) -> Dict:
 
 
 def get_sales_trends_charts(start_date: datetime = None, end_date: datetime = None, branch_id: int = None) -> Dict:
-    """Get sales trends charts data with various metrics."""
+    """Get sales trends charts data with various metrics (multi-currency support)."""
     now = timezone.now()
     if not start_date:
         start_date = now - timedelta(days=30)
@@ -1719,120 +1998,163 @@ def get_sales_trends_charts(start_date: datetime = None, end_date: datetime = No
         created_at__gte=start_date,
         created_at__lte=end_date,
         status='completed'
-    )
+    ).select_related('branch').prefetch_related('items')
     
     if branch_id:
         base_queryset = base_queryset.filter(branch_id=branch_id)
     
-    net_revenue_expr = ExpressionWrapper(
-        F('total_amount') - F('discount') + F('tax'),
-        output_field=DecimalField(max_digits=14, decimal_places=2),
-    )
+    # Process sales to convert amounts to USD
+    daily_sales_data = defaultdict(lambda: {
+        'transaction_count': 0,
+        'total_revenue_usd': Decimal('0'),
+        'total_items_sold': Decimal('0'),
+        'total_cost_usd': Decimal('0'),
+    })
     
-    cost_expr = ExpressionWrapper(
-        F('items__purchase_price') * F('items__quantity'),
-        output_field=DecimalField(max_digits=14, decimal_places=2),
-    )
+    weekly_sales_data = defaultdict(lambda: {
+        'week_key': None,
+        'transaction_count': 0,
+        'total_revenue_usd': Decimal('0'),
+        'total_items_sold': Decimal('0'),
+        'total_cost_usd': Decimal('0'),
+    })
     
-    # Daily sales volume and revenue
-    daily_sales = list(
-        base_queryset.annotate(day=TruncDate('created_at'))
-        .values('day')
-        .annotate(
-            transaction_count=Count('id'),
-            total_revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-            total_items_sold=Coalesce(Sum('items__quantity'), Decimal('0')),
-            total_cost=Coalesce(Sum(cost_expr), Decimal('0')),
-        )
-        .order_by('day')
-    )
+    payment_method_data = defaultdict(lambda: {
+        'transaction_count': 0,
+        'total_revenue_usd': Decimal('0'),
+    })
     
-    # Weekly sales trends
-    weekly_sales = list(
-        base_queryset.annotate(week=TruncWeek('created_at'))
-        .values('week')
-        .annotate(
-            transaction_count=Count('id'),
-            total_revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-            total_items_sold=Coalesce(Sum('items__quantity'), Decimal('0')),
-            total_cost=Coalesce(Sum(cost_expr), Decimal('0')),
-        )
-        .order_by('week')
-    )
+    branch_sales_data = defaultdict(lambda: {
+        'branch_id': None,
+        'branch_name': None,
+        'transaction_count': 0,
+        'total_revenue_usd': Decimal('0'),
+        'total_items_sold': Decimal('0'),
+    })
     
-    # Sales by payment method
-    sales_by_payment = list(
-        base_queryset.values('type_of_payment')
-        .annotate(
-            transaction_count=Count('id'),
-            total_revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-        )
-        .order_by('-total_revenue')
-    )
+    product_sales_data = defaultdict(lambda: {
+        'product_id': None,
+        'product_name': None,
+        'product_sku': None,
+        'total_quantity_sold': Decimal('0'),
+        'total_revenue_usd': Decimal('0'),
+        'total_cost_usd': Decimal('0'),
+    })
     
+    for sale in base_queryset:
+        day = sale.created_at.date()
+        # Calculate week start (Monday)
+        days_since_monday = sale.created_at.weekday()
+        week_start_date = sale.created_at.date() - timedelta(days=days_since_monday)
+        
+        net_revenue = sale.total_amount - sale.discount + sale.tax
+        net_revenue_usd = sales_services.convert_zig_to_usd(net_revenue, sale.type_of_payment)
+        
+        # Daily aggregation
+        daily_sales_data[day]['transaction_count'] += 1
+        daily_sales_data[day]['total_revenue_usd'] += net_revenue_usd
+        
+        # Weekly aggregation
+        weekly_sales_data[week_start_date]['week_key'] = week_start_date
+        weekly_sales_data[week_start_date]['transaction_count'] += 1
+        weekly_sales_data[week_start_date]['total_revenue_usd'] += net_revenue_usd
+        
+        # Payment method aggregation
+        payment_method_data[sale.type_of_payment]['transaction_count'] += 1
+        payment_method_data[sale.type_of_payment]['total_revenue_usd'] += net_revenue_usd
+        
+        # Branch aggregation
+        if sale.branch:
+            branch_id_key = sale.branch.id
+            branch_sales_data[branch_id_key]['branch_id'] = branch_id_key
+            branch_sales_data[branch_id_key]['branch_name'] = sale.branch.name
+            branch_sales_data[branch_id_key]['transaction_count'] += 1
+            branch_sales_data[branch_id_key]['total_revenue_usd'] += net_revenue_usd
+        
+        # Process items for cost and product aggregation
+        for item in sale.items.all():
+            daily_sales_data[day]['total_items_sold'] += item.quantity
+            weekly_sales_data[week_start_date]['total_items_sold'] += item.quantity
+            
+            if sale.branch:
+                branch_sales_data[branch_id_key]['total_items_sold'] += item.quantity
+            
+            # Cost conversion
+            item_cost = item.purchase_price * item.quantity
+            item_cost_usd = sales_services.convert_zig_to_usd(item_cost, sale.type_of_payment)
+            daily_sales_data[day]['total_cost_usd'] += item_cost_usd
+            weekly_sales_data[week_start_date]['total_cost_usd'] += item_cost_usd
+            
+            # Product aggregation
+            product_id = item.product_id
+            product_sales_data[product_id]['product_id'] = product_id
+            product_sales_data[product_id]['product_name'] = item.product.name
+            product_sales_data[product_id]['product_sku'] = item.product.sku
+            product_sales_data[product_id]['total_quantity_sold'] += item.quantity
+            
+            item_revenue = item.subtotal
+            item_revenue_usd = sales_services.convert_zig_to_usd(item_revenue, sale.type_of_payment)
+            product_sales_data[product_id]['total_revenue_usd'] += item_revenue_usd
+            product_sales_data[product_id]['total_cost_usd'] += item_cost_usd
+    
+    # Format daily sales
+    daily_sales = [
+        {
+            'day': day,
+            'transaction_count': data['transaction_count'],
+            'total_revenue': data['total_revenue_usd'],  # Combined in USD
+            'total_items_sold': data['total_items_sold'],
+            'total_cost': data['total_cost_usd'],
+        }
+        for day, data in sorted(daily_sales_data.items())
+    ]
+    
+    # Format weekly sales
+    weekly_sales = [
+        {
+            'week': week_date,
+            'transaction_count': data['transaction_count'],
+            'total_revenue': data['total_revenue_usd'],  # Combined in USD
+            'total_items_sold': data['total_items_sold'],
+            'total_cost': data['total_cost_usd'],
+        }
+        for week_date, data in sorted(weekly_sales_data.items())
+    ]
+    
+    # Format payment method stats
     payment_method_stats = [
         {
-            'payment_method': entry['type_of_payment'],
-            'transaction_count': entry['transaction_count'],
-            'total_revenue': entry['total_revenue'],
+            'payment_method': method,
+            'transaction_count': data['transaction_count'],
+            'total_revenue': data['total_revenue_usd'],  # Combined in USD
         }
-        for entry in sales_by_payment
+        for method, data in sorted(payment_method_data.items(), key=lambda x: x[1]['total_revenue_usd'], reverse=True)
     ]
     
-    # Sales by branch
-    sales_by_branch = list(
-        base_queryset.values('branch__id', 'branch__name')
-        .annotate(
-            transaction_count=Count('id'),
-            total_revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-            total_items_sold=Coalesce(Sum('items__quantity'), Decimal('0')),
-        )
-        .order_by('-total_revenue')
-    )
-    
+    # Format branch sales stats
     branch_sales_stats = [
         {
-            'branch_id': entry['branch__id'],
-            'branch_name': entry['branch__name'],
-            'transaction_count': entry['transaction_count'],
-            'total_revenue': entry['total_revenue'],
-            'total_items_sold': entry['total_items_sold'],
+            'branch_id': data['branch_id'],
+            'branch_name': data['branch_name'],
+            'transaction_count': data['transaction_count'],
+            'total_revenue': data['total_revenue_usd'],  # Combined in USD
+            'total_items_sold': data['total_items_sold'],
         }
-        for entry in sales_by_branch
+        for data in sorted(branch_sales_data.values(), key=lambda x: x['total_revenue_usd'], reverse=True)
     ]
     
-    # Top selling products
-    product_cost_expr = ExpressionWrapper(
-        F('purchase_price') * F('quantity'),
-        output_field=DecimalField(max_digits=14, decimal_places=2),
-    )
-    
-    top_selling_products = list(
-        SaleItem.objects.filter(
-            sale__created_at__gte=start_date,
-            sale__created_at__lte=end_date,
-            sale__status='completed'
-        )
-        .values('product_id', 'product__name', 'product__sku')
-        .annotate(
-            total_quantity_sold=Coalesce(Sum('quantity'), Decimal('0')),
-            total_revenue=Coalesce(Sum('subtotal'), Decimal('0')),
-            total_cost=Coalesce(Sum(product_cost_expr), Decimal('0')),
-        )
-        .order_by('-total_quantity_sold')[:20]
-    )
-    
+    # Format top selling products
     top_products = [
         {
-            'product_id': entry['product_id'],
-            'product_name': entry['product__name'],
-            'product_sku': entry['product__sku'],
-            'total_quantity_sold': entry['total_quantity_sold'],
-            'total_revenue': entry['total_revenue'],
-            'total_cost': entry['total_cost'],
-            'profit': entry['total_revenue'] - entry['total_cost'],
+            'product_id': data['product_id'],
+            'product_name': data['product_name'],
+            'product_sku': data['product_sku'],
+            'total_quantity_sold': data['total_quantity_sold'],
+            'total_revenue': data['total_revenue_usd'],  # Combined in USD
+            'total_cost': data['total_cost_usd'],
+            'profit': data['total_revenue_usd'] - data['total_cost_usd'],
         }
-        for entry in top_selling_products
+        for data in sorted(product_sales_data.values(), key=lambda x: x['total_quantity_sold'], reverse=True)[:20]
     ]
     
     return {
@@ -2034,28 +2356,55 @@ def get_sales_report(start_date: datetime = None, end_date: datetime = None, bra
     if cashier_id:
         base_queryset = base_queryset.filter(cashier_id=cashier_id)
     
-    net_revenue_expr = ExpressionWrapper(
-        F('total_amount') - F('discount') + F('tax'),
-        output_field=DecimalField(max_digits=14, decimal_places=2),
-    )
+    # Calculate summary with ZIG to USD conversion
+    # Get all sale items to calculate revenue and cost properly
+    sale_items = SaleItem.objects.filter(
+        sale__in=base_queryset
+    ).select_related('sale')
     
-    # Overall summary
-    summary = base_queryset.aggregate(
-        total_transactions=Count('id'),
-        total_revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-        total_discount=Coalesce(Sum('discount'), Decimal('0')),
-        total_tax=Coalesce(Sum('tax'), Decimal('0')),
-        total_items_sold=Coalesce(Sum('items__quantity'), Decimal('0')),
-        total_cost=Coalesce(
-            Sum(
-                ExpressionWrapper(
-                    F('items__purchase_price') * F('items__quantity'),
-                    output_field=DecimalField(max_digits=14, decimal_places=2),
-                )
-            ),
-            Decimal('0')
-        ),
-    )
+    # Calculate totals converting ZIG amounts to USD
+    total_revenue = Decimal('0')
+    total_cost = Decimal('0')
+    total_discount = Decimal('0')
+    total_tax = Decimal('0')
+    total_items_sold = Decimal('0')
+    
+    for item in sale_items:
+        payment_method = item.sale.type_of_payment
+        # Convert revenue (net amount: total_amount - discount + tax) from ZIG to USD if needed
+        item_revenue = item.subtotal
+        item_revenue_usd = sales_services.convert_zig_to_usd(item_revenue, payment_method)
+        total_revenue += item_revenue_usd
+        
+        # Convert cost from ZIG to USD if needed
+        item_cost = item.purchase_price * item.quantity
+        item_cost_usd = sales_services.convert_zig_to_usd(item_cost, payment_method)
+        total_cost += item_cost_usd
+        
+        # Convert discount and tax from ZIG to USD if needed
+        # Note: discount and tax are at sale level, so we need to distribute proportionally
+        # For simplicity, we'll convert the sale's discount and tax proportionally
+        sale = item.sale
+        if sale.total_amount > 0:
+            item_proportion = item.subtotal / sale.total_amount if sale.total_amount > 0 else Decimal('0')
+            item_discount = sale.discount * item_proportion
+            item_tax = sale.tax * item_proportion
+            total_discount += sales_services.convert_zig_to_usd(item_discount, payment_method)
+            total_tax += sales_services.convert_zig_to_usd(item_tax, payment_method)
+        
+        total_items_sold += item.quantity
+    
+    # Get unique sales count
+    total_transactions = base_queryset.count()
+    
+    summary = {
+        'total_transactions': total_transactions,
+        'total_revenue': total_revenue,
+        'total_discount': total_discount,
+        'total_tax': total_tax,
+        'total_items_sold': total_items_sold,
+        'total_cost': total_cost,
+    }
     
     total_profit = summary['total_revenue'] - summary['total_cost']
     profit_margin = (
@@ -2330,21 +2679,35 @@ def get_auditor_dashboard_data() -> Dict:
         audit_logs__timestamp__gte=seven_days_ago
     ).distinct().count()
     
-    # Financial summary (last 30 days)
-    net_revenue_expr = ExpressionWrapper(
-        F('total_amount') - F('discount') + F('tax'),
-        output_field=DecimalField(max_digits=14, decimal_places=2),
-    )
-    
-    financial_summary = Sale.objects.filter(
+    # Financial summary (last 30 days) - with multi-currency support
+    completed_sales_30d = Sale.objects.filter(
         created_at__gte=thirty_days_ago,
         status='completed'
-    ).aggregate(
-        total_revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-        total_transactions=Count('id'),
-        total_discount=Coalesce(Sum('discount'), Decimal('0')),
-        total_tax=Coalesce(Sum('tax'), Decimal('0')),
-    )
+    ).select_related()
+    
+    total_revenue_usd = Decimal('0')
+    total_discount_usd = Decimal('0')
+    total_tax_usd = Decimal('0')
+    total_transactions = 0
+    
+    for sale in completed_sales_30d:
+        total_transactions += 1
+        net_revenue = sale.total_amount - sale.discount + sale.tax
+        net_revenue_usd = sales_services.convert_zig_to_usd(net_revenue, sale.type_of_payment)
+        total_revenue_usd += net_revenue_usd
+        
+        discount_usd = sales_services.convert_zig_to_usd(sale.discount, sale.type_of_payment)
+        total_discount_usd += discount_usd
+        
+        tax_usd = sales_services.convert_zig_to_usd(sale.tax, sale.type_of_payment)
+        total_tax_usd += tax_usd
+    
+    financial_summary = {
+        'total_revenue': total_revenue_usd,  # Combined in USD
+        'total_transactions': total_transactions,
+        'total_discount': total_discount_usd,
+        'total_tax': total_tax_usd,
+    }
     
     return {
         'system_summary': {
@@ -2481,59 +2844,98 @@ def get_auditor_reports(
         .order_by('-count')
     )
     
-    # Sales summary
+    # Sales summary (with multi-currency support)
     sales_queryset = Sale.objects.filter(
         created_at__gte=start_date,
         created_at__lte=end_date,
-    )
+    ).select_related('branch').prefetch_related('items')
     if branch_id:
         sales_queryset = sales_queryset.filter(branch_id=branch_id)
     
-    net_revenue_expr = ExpressionWrapper(
-        F('total_amount') - F('discount') + F('tax'),
-        output_field=DecimalField(max_digits=14, decimal_places=2),
-    )
+    # Count sales by status
+    total_sales = sales_queryset.count()
+    completed_sales = sales_queryset.filter(status='completed').count()
+    cancelled_sales = sales_queryset.filter(status='cancelled').count()
+    returned_sales = sales_queryset.filter(status='returned').count()
+    pending_sales = sales_queryset.filter(status='pending').count()
     
-    sales_summary = sales_queryset.aggregate(
-        total_sales=Count('id'),
-        completed_sales=Count('id', filter=Q(status='completed')),
-        cancelled_sales=Count('id', filter=Q(status='cancelled')),
-        returned_sales=Count('id', filter=Q(status='returned')),
-        pending_sales=Count('id', filter=Q(status='pending')),
-        total_revenue=Coalesce(Sum(net_revenue_expr, filter=Q(status='completed')), Decimal('0')),
-        total_amount=Coalesce(Sum('total_amount', filter=Q(status='completed')), Decimal('0')),
-        total_discount=Coalesce(Sum('discount', filter=Q(status='completed')), Decimal('0')),
-        total_tax=Coalesce(Sum('tax', filter=Q(status='completed')), Decimal('0')),
-        total_items_sold=Coalesce(Sum('items__quantity', filter=Q(status='completed')), Decimal('0')),
-    )
+    # Calculate totals in USD for completed sales
+    completed_sales_list = sales_queryset.filter(status='completed')
+    total_revenue_usd = Decimal('0')
+    total_amount_usd = Decimal('0')
+    total_discount_usd = Decimal('0')
+    total_tax_usd = Decimal('0')
+    total_items_sold = Decimal('0')
     
-    # Payments summary by payment method
-    payments_summary = list(
-        sales_queryset.filter(status='completed')
-        .values('type_of_payment')
-        .annotate(
-            transaction_count=Count('id'),
-            total_revenue=Coalesce(Sum(net_revenue_expr), Decimal('0')),
-            total_amount=Coalesce(Sum('total_amount'), Decimal('0')),
-            total_discount=Coalesce(Sum('discount'), Decimal('0')),
-            total_tax=Coalesce(Sum('tax'), Decimal('0')),
-        )
-        .order_by('-total_revenue')
-    )
+    for sale in completed_sales_list:
+        net_revenue = sale.total_amount - sale.discount + sale.tax
+        net_revenue_usd = sales_services.convert_zig_to_usd(net_revenue, sale.type_of_payment)
+        total_revenue_usd += net_revenue_usd
+        
+        amount_usd = sales_services.convert_zig_to_usd(sale.total_amount, sale.type_of_payment)
+        total_amount_usd += amount_usd
+        
+        discount_usd = sales_services.convert_zig_to_usd(sale.discount, sale.type_of_payment)
+        total_discount_usd += discount_usd
+        
+        tax_usd = sales_services.convert_zig_to_usd(sale.tax, sale.type_of_payment)
+        total_tax_usd += tax_usd
+        
+        for item in sale.items.all():
+            total_items_sold += item.quantity
+    
+    sales_summary = {
+        'total_sales': total_sales,
+        'completed_sales': completed_sales,
+        'cancelled_sales': cancelled_sales,
+        'returned_sales': returned_sales,
+        'pending_sales': pending_sales,
+        'total_revenue': total_revenue_usd,  # Combined in USD
+        'total_amount': total_amount_usd,
+        'total_discount': total_discount_usd,
+        'total_tax': total_tax_usd,
+        'total_items_sold': total_items_sold,
+    }
+    
+    # Payments summary by payment method (with multi-currency support)
+    payment_method_data_dict = defaultdict(lambda: {
+        'transaction_count': 0,
+        'total_revenue_usd': Decimal('0'),
+        'total_amount_usd': Decimal('0'),
+        'total_discount_usd': Decimal('0'),
+        'total_tax_usd': Decimal('0'),
+    })
+    
+    for sale in completed_sales_list:
+        payment_method = sale.type_of_payment
+        payment_method_data_dict[payment_method]['transaction_count'] += 1
+        
+        net_revenue = sale.total_amount - sale.discount + sale.tax
+        net_revenue_usd = sales_services.convert_zig_to_usd(net_revenue, sale.type_of_payment)
+        payment_method_data_dict[payment_method]['total_revenue_usd'] += net_revenue_usd
+        
+        amount_usd = sales_services.convert_zig_to_usd(sale.total_amount, sale.type_of_payment)
+        payment_method_data_dict[payment_method]['total_amount_usd'] += amount_usd
+        
+        discount_usd = sales_services.convert_zig_to_usd(sale.discount, sale.type_of_payment)
+        payment_method_data_dict[payment_method]['total_discount_usd'] += discount_usd
+        
+        tax_usd = sales_services.convert_zig_to_usd(sale.tax, sale.type_of_payment)
+        payment_method_data_dict[payment_method]['total_tax_usd'] += tax_usd
     
     payments_summary_data = []
-    for entry in payments_summary:
-        transaction_count = entry['transaction_count'] or 0
-        total_revenue = entry['total_revenue'] or Decimal('0')
+    for payment_method, data in sorted(payment_method_data_dict.items(), key=lambda x: x[1]['total_revenue_usd'], reverse=True):
+        transaction_count = data['transaction_count']
+        total_revenue = data['total_revenue_usd']
         average_transaction = total_revenue / transaction_count if transaction_count > 0 else Decimal('0')
         
         payments_summary_data.append({
-            'payment_method': entry['type_of_payment'],
+            'payment_method': payment_method,
             'transaction_count': transaction_count,
-            'total_revenue': total_revenue,
-            'total_amount': entry['total_amount'] or Decimal('0'),
-            'total_discount': entry['total_discount'] or Decimal('0'),
-            'total_tax': entry['total_tax'] or Decimal('0'),
+            'total_revenue': total_revenue,  # Combined in USD
+            'total_amount': data['total_amount_usd'],
+            'total_discount': data['total_discount_usd'],
+            'total_tax': data['total_tax_usd'],
             'average_transaction': average_transaction,
             'percentage_of_total': (
                 (total_revenue / sales_summary['total_revenue'] * 100)
@@ -2541,52 +2943,73 @@ def get_auditor_reports(
             ),
         })
     
-    # Return summary
+    # Return summary (with multi-currency support)
     returns_queryset = ProductReturn.objects.filter(
         created_at__gte=start_date,
         created_at__lte=end_date,
-    )
+    ).select_related('sale')
     if branch_id:
         returns_queryset = returns_queryset.filter(sale__branch_id=branch_id)
     
-    return_summary = returns_queryset.aggregate(
-        total_returns=Count('id'),
-        total_quantity_returned=Coalesce(Sum('quantity'), Decimal('0')),
-        total_refund_amount=Coalesce(Sum('refund_amount'), Decimal('0')),
-        unique_products_returned=Count('product', distinct=True),
-        unique_sales_with_returns=Count('sale', distinct=True),
-    )
+    total_returns = returns_queryset.count()
+    total_quantity_returned = returns_queryset.aggregate(total=Sum('quantity'))['total'] or Decimal('0')
+    unique_products_returned = returns_queryset.values('product').distinct().count()
+    unique_sales_with_returns = returns_queryset.values('sale').distinct().count()
     
-    # Return analysis
-    return_analysis = list(
-        returns_queryset.values(
-            'product_id',
-            'product__name',
-            'product__sku',
-            'product__category__name',
-        )
-        .annotate(
-            return_count=Count('id'),
-            total_quantity=Coalesce(Sum('quantity'), Decimal('0')),
-            total_refund=Coalesce(Sum('refund_amount'), Decimal('0')),
-        )
-        .order_by('-total_refund')[:20]
-    )
+    # Convert refund amounts to USD
+    total_refund_amount_usd = Decimal('0')
+    for return_item in returns_queryset:
+        refund_usd = sales_services.convert_zig_to_usd(return_item.refund_amount, return_item.sale.type_of_payment)
+        total_refund_amount_usd += refund_usd
+    
+    return_summary = {
+        'total_returns': total_returns,
+        'total_quantity_returned': total_quantity_returned,
+        'total_refund_amount': total_refund_amount_usd,  # Combined in USD
+        'unique_products_returned': unique_products_returned,
+        'unique_sales_with_returns': unique_sales_with_returns,
+    }
+    
+    # Return analysis (with multi-currency support)
+    return_analysis_queryset = returns_queryset.select_related('product', 'product__category', 'sale')
+    
+    # Group by product and convert refunds to USD
+    product_returns_data = defaultdict(lambda: {
+        'product_id': None,
+        'product_name': None,
+        'product_sku': None,
+        'category_name': None,
+        'return_count': 0,
+        'total_quantity': Decimal('0'),
+        'total_refund_usd': Decimal('0'),
+    })
+    
+    for return_item in return_analysis_queryset:
+        product_id = return_item.product_id
+        product_returns_data[product_id]['product_id'] = product_id
+        product_returns_data[product_id]['product_name'] = return_item.product.name
+        product_returns_data[product_id]['product_sku'] = return_item.product.sku
+        product_returns_data[product_id]['category_name'] = return_item.product.category.name if return_item.product.category else 'Uncategorized'
+        product_returns_data[product_id]['return_count'] += 1
+        product_returns_data[product_id]['total_quantity'] += return_item.quantity
+        
+        refund_usd = sales_services.convert_zig_to_usd(return_item.refund_amount, return_item.sale.type_of_payment)
+        product_returns_data[product_id]['total_refund_usd'] += refund_usd
     
     return_analysis_data = []
-    for entry in return_analysis:
-        total_quantity = entry['total_quantity'] or Decimal('0')
-        total_refund = entry['total_refund'] or Decimal('0')
+    for product_id, data in sorted(product_returns_data.items(), key=lambda x: x[1]['total_refund_usd'], reverse=True)[:20]:
+        total_quantity = data['total_quantity']
+        total_refund = data['total_refund_usd']
         avg_refund_per_unit = total_refund / total_quantity if total_quantity > 0 else Decimal('0')
         
         return_analysis_data.append({
-            'product_id': entry['product_id'],
-            'product_name': entry['product__name'],
-            'product_sku': entry['product__sku'],
-            'category_name': entry['product__category__name'] or 'Uncategorized',
-            'return_count': entry['return_count'],
+            'product_id': data['product_id'],
+            'product_name': data['product_name'],
+            'product_sku': data['product_sku'],
+            'category_name': data['category_name'],
+            'return_count': data['return_count'],
             'total_quantity_returned': total_quantity,
-            'total_refund_amount': total_refund,
+            'total_refund_amount': total_refund,  # Combined in USD
             'average_refund_per_unit': avg_refund_per_unit,
         })
     
@@ -2885,115 +3308,108 @@ def get_product_performance(
     if not end_date:
         end_date = now
     
-    # Base queryset for sale items
+    # Base queryset for sale items (with sales for currency conversion)
     base_queryset = SaleItem.objects.filter(
         sale__created_at__gte=start_date,
         sale__created_at__lte=end_date,
         sale__status='completed'
-    )
+    ).select_related('sale', 'product', 'product__category')
     
     if branch_id:
         base_queryset = base_queryset.filter(sale__branch_id=branch_id)
     
-    # Calculate product cost expression
-    product_cost_expr = ExpressionWrapper(
-        F('purchase_price') * F('quantity'),
-        output_field=DecimalField(max_digits=14, decimal_places=2),
-    )
+    # Aggregate product performance with currency conversion
+    product_data = defaultdict(lambda: {
+        'product_id': None,
+        'product_name': None,
+        'product_sku': None,
+        'category_id': None,
+        'category_name': None,
+        'total_quantity_sold': Decimal('0'),
+        'total_revenue_usd': Decimal('0'),
+        'total_cost_usd': Decimal('0'),
+        'transaction_ids': set(),
+    })
     
-    # Overall Product Rankings
-    overall_products = list(
-        base_queryset.values(
-            'product_id',
-            'product__name',
-            'product__sku',
-            'product__category_id',
-            'product__category__name'
-        )
-        .annotate(
-            total_quantity_sold=Coalesce(Sum('quantity'), Decimal('0')),
-            total_revenue=Coalesce(Sum('subtotal'), Decimal('0')),
-            total_cost=Coalesce(Sum(product_cost_expr), Decimal('0')),
-            transaction_count=Count('sale_id', distinct=True),
-        )
-        .annotate(
-            total_profit=ExpressionWrapper(
-                F('total_revenue') - F('total_cost'),
-                output_field=DecimalField(max_digits=14, decimal_places=2)
-            )
-        )
-        .order_by('-total_revenue')[:limit]
-    )
+    for item in base_queryset:
+        product_id = item.product_id
+        product_data[product_id]['product_id'] = product_id
+        product_data[product_id]['product_name'] = item.product.name
+        product_data[product_id]['product_sku'] = item.product.sku
+        product_data[product_id]['category_id'] = item.product.category.id if item.product.category else None
+        product_data[product_id]['category_name'] = item.product.category.name if item.product.category else None
+        product_data[product_id]['total_quantity_sold'] += item.quantity
+        product_data[product_id]['transaction_ids'].add(item.sale_id)
+        
+        # Convert revenue and cost to USD
+        revenue_usd = sales_services.convert_zig_to_usd(item.subtotal, item.sale.type_of_payment)
+        product_data[product_id]['total_revenue_usd'] += revenue_usd
+        
+        item_cost = item.purchase_price * item.quantity
+        cost_usd = sales_services.convert_zig_to_usd(item_cost, item.sale.type_of_payment)
+        product_data[product_id]['total_cost_usd'] += cost_usd
     
     # Format overall rankings
     overall_rankings = []
-    for rank, product in enumerate(overall_products, 1):
-        profit_margin = (
-            (product['total_profit'] / product['total_revenue'] * 100)
-            if product['total_revenue'] > 0
-            else Decimal('0')
-        )
+    sorted_products = sorted(product_data.items(), key=lambda x: x[1]['total_revenue_usd'], reverse=True)[:limit]
+    
+    for rank, (product_id, data) in enumerate(sorted_products, 1):
+        total_revenue = data['total_revenue_usd']
+        total_cost = data['total_cost_usd']
+        total_profit = total_revenue - total_cost
+        profit_margin = (total_profit / total_revenue * 100) if total_revenue > 0 else Decimal('0')
+        
         overall_rankings.append({
             'rank': rank,
-            'product_id': product['product_id'],
-            'product_name': product['product__name'],
-            'product_sku': product['product__sku'],
-            'category_id': product['product__category_id'],
-            'category_name': product['product__category__name'],
-            'total_quantity_sold': float(product['total_quantity_sold']),
-            'total_revenue': float(product['total_revenue']),
-            'total_cost': float(product['total_cost']),
-            'total_profit': float(product['total_profit']),
+            'product_id': data['product_id'],
+            'product_name': data['product_name'],
+            'product_sku': data['product_sku'],
+            'category_id': data['category_id'],
+            'category_name': data['category_name'],
+            'total_quantity_sold': float(data['total_quantity_sold']),
+            'total_revenue': float(total_revenue),  # Combined in USD
+            'total_cost': float(total_cost),
+            'total_profit': float(total_profit),
             'profit_margin': float(profit_margin),
-            'transaction_count': product['transaction_count'],
+            'transaction_count': len(data['transaction_ids']),
         })
     
-    # Rankings by Category
+    # Rankings by Category (with multi-currency support)
     category_rankings = {}
     categories = Category.objects.all()
     
     for category in categories:
-        category_products = list(
-            base_queryset.filter(product__category=category)
-            .values(
-                'product_id',
-                'product__name',
-                'product__sku'
-            )
-            .annotate(
-                total_quantity_sold=Coalesce(Sum('quantity'), Decimal('0')),
-                total_revenue=Coalesce(Sum('subtotal'), Decimal('0')),
-                total_cost=Coalesce(Sum(product_cost_expr), Decimal('0')),
-                transaction_count=Count('sale_id', distinct=True),
-            )
-            .annotate(
-                total_profit=ExpressionWrapper(
-                    F('total_revenue') - F('total_cost'),
-                    output_field=DecimalField(max_digits=14, decimal_places=2)
-                )
-            )
-            .order_by('-total_revenue')[:limit]
-        )
+        # Filter products by category from our aggregated data
+        category_product_data = {
+            pid: data for pid, data in product_data.items()
+            if data['category_id'] == category.id
+        }
         
-        if category_products:
+        if category_product_data:
             category_list = []
-            for rank, product in enumerate(category_products, 1):
-                profit_margin = (
-                    (product['total_profit'] / product['total_revenue'] * 100)
-                    if product['total_revenue'] > 0
-                    else Decimal('0')
-                )
+            sorted_category_products = sorted(
+                category_product_data.items(),
+                key=lambda x: x[1]['total_revenue_usd'],
+                reverse=True
+            )[:limit]
+            
+            for rank, (product_id, data) in enumerate(sorted_category_products, 1):
+                total_revenue = data['total_revenue_usd']
+                total_cost = data['total_cost_usd']
+                total_profit = total_revenue - total_cost
+                profit_margin = (total_profit / total_revenue * 100) if total_revenue > 0 else Decimal('0')
+                
                 category_list.append({
                     'rank': rank,
-                    'product_id': product['product_id'],
-                    'product_name': product['product__name'],
-                    'product_sku': product['product__sku'],
-                    'total_quantity_sold': float(product['total_quantity_sold']),
-                    'total_revenue': float(product['total_revenue']),
-                    'total_cost': float(product['total_cost']),
-                    'total_profit': float(product['total_profit']),
+                    'product_id': data['product_id'],
+                    'product_name': data['product_name'],
+                    'product_sku': data['product_sku'],
+                    'total_quantity_sold': float(data['total_quantity_sold']),
+                    'total_revenue': float(total_revenue),  # Combined in USD
+                    'total_cost': float(total_cost),
+                    'total_profit': float(total_profit),
                     'profit_margin': float(profit_margin),
-                    'transaction_count': product['transaction_count'],
+                    'transaction_count': len(data['transaction_ids']),
                 })
             
             category_rankings[category.name] = {
@@ -3003,63 +3419,50 @@ def get_product_performance(
                 'total_products': len(category_list),
             }
     
-    # Rankings by Supplier
-    # Get products with their most recent supplier from stock entries
+    # Rankings by Supplier (with multi-currency support)
     supplier_rankings = {}
     suppliers = Supplier.objects.all()
     
     for supplier in suppliers:
         # Get products that have been purchased from this supplier
-        supplier_products = StockEntry.objects.filter(
+        supplier_product_ids = StockEntry.objects.filter(
             supplier=supplier
         ).values_list('product_id', flat=True).distinct()
         
-        if supplier_products:
-            supplier_sales = list(
-                base_queryset.filter(product_id__in=supplier_products)
-                .values(
-                    'product_id',
-                    'product__name',
-                    'product__sku',
-                    'product__category_id',
-                    'product__category__name'
-                )
-                .annotate(
-                    total_quantity_sold=Coalesce(Sum('quantity'), Decimal('0')),
-                    total_revenue=Coalesce(Sum('subtotal'), Decimal('0')),
-                    total_cost=Coalesce(Sum(product_cost_expr), Decimal('0')),
-                    transaction_count=Count('sale_id', distinct=True),
-                )
-                .annotate(
-                    total_profit=ExpressionWrapper(
-                        F('total_revenue') - F('total_cost'),
-                        output_field=DecimalField(max_digits=14, decimal_places=2)
-                    )
-                )
-                .order_by('-total_revenue')[:limit]
-            )
+        if supplier_product_ids:
+            # Filter products from our aggregated data
+            supplier_product_data = {
+                pid: data for pid, data in product_data.items()
+                if pid in supplier_product_ids
+            }
             
-            if supplier_sales:
+            if supplier_product_data:
                 supplier_list = []
-                for rank, product in enumerate(supplier_sales, 1):
-                    profit_margin = (
-                        (product['total_profit'] / product['total_revenue'] * 100)
-                        if product['total_revenue'] > 0
-                        else Decimal('0')
-                    )
+                sorted_supplier_products = sorted(
+                    supplier_product_data.items(),
+                    key=lambda x: x[1]['total_revenue_usd'],
+                    reverse=True
+                )[:limit]
+                
+                for rank, (product_id, data) in enumerate(sorted_supplier_products, 1):
+                    total_revenue = data['total_revenue_usd']
+                    total_cost = data['total_cost_usd']
+                    total_profit = total_revenue - total_cost
+                    profit_margin = (total_profit / total_revenue * 100) if total_revenue > 0 else Decimal('0')
+                    
                     supplier_list.append({
                         'rank': rank,
-                        'product_id': product['product_id'],
-                        'product_name': product['product__name'],
-                        'product_sku': product['product__sku'],
-                        'category_id': product['product__category_id'],
-                        'category_name': product['product__category__name'],
-                        'total_quantity_sold': float(product['total_quantity_sold']),
-                        'total_revenue': float(product['total_revenue']),
-                        'total_cost': float(product['total_cost']),
-                        'total_profit': float(product['total_profit']),
+                        'product_id': data['product_id'],
+                        'product_name': data['product_name'],
+                        'product_sku': data['product_sku'],
+                        'category_id': data['category_id'],
+                        'category_name': data['category_name'],
+                        'total_quantity_sold': float(data['total_quantity_sold']),
+                        'total_revenue': float(total_revenue),  # Combined in USD
+                        'total_cost': float(total_cost),
+                        'total_profit': float(total_profit),
                         'profit_margin': float(profit_margin),
-                        'transaction_count': product['transaction_count'],
+                        'transaction_count': len(data['transaction_ids']),
                     })
                 
                 supplier_rankings[supplier.name] = {
@@ -3127,24 +3530,25 @@ def get_product_performance(
         hour = sale.created_at.hour
         day_num = sale.created_at.weekday()  # 0=Monday, 1=Tuesday, ..., 6=Sunday
         
-        # Calculate metrics
+        # Calculate metrics with currency conversion
         net_revenue = sale.total_amount - sale.discount + sale.tax
+        net_revenue_usd = sales_services.convert_zig_to_usd(net_revenue, sale.type_of_payment)
         total_items = sum(item.quantity for item in sale.items.all())
         
         # Update hour heatmap
         hour_heatmap[hour]['transaction_count'] += 1
-        hour_heatmap[hour]['total_revenue'] += net_revenue
+        hour_heatmap[hour]['total_revenue'] += net_revenue_usd  # Converted to USD
         hour_heatmap[hour]['total_items_sold'] += total_items
         
         # Update day heatmap
         day_heatmap[day_num]['transaction_count'] += 1
-        day_heatmap[day_num]['total_revenue'] += net_revenue
+        day_heatmap[day_num]['total_revenue'] += net_revenue_usd  # Converted to USD
         day_heatmap[day_num]['total_items_sold'] += total_items
         
         # Update heat map matrix
         day_name = day_names[day_num]
         heatmap_matrix[day_name][hour]['transaction_count'] += 1
-        heatmap_matrix[day_name][hour]['total_revenue'] += net_revenue
+        heatmap_matrix[day_name][hour]['total_revenue'] += net_revenue_usd  # Converted to USD
         heatmap_matrix[day_name][hour]['total_items_sold'] += total_items
     
     # Convert to float for JSON serialization

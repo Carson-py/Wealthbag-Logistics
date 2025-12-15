@@ -2,7 +2,7 @@ from decimal import Decimal
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import Sale, SaleItem, ProductReturn, Discount, ReturnAuthorizationCode, CashReceived
+from .models import ExchangeRate, Sale, SaleItem, ProductReturn, Discount, ReturnAuthorizationCode, CashReceived
 
 
 class SaleItemSerializer(serializers.ModelSerializer):
@@ -325,12 +325,14 @@ class CashReceivedSerializer(serializers.ModelSerializer):
     cashier_name = serializers.SerializerMethodField()
     branch_name = serializers.CharField(source='branch.name', read_only=True)
     entered_by_email = serializers.CharField(source='entered_by.email', read_only=True)
+    type_of_payment_display = serializers.CharField(source='get_type_of_payment_display', read_only=True)
     
     class Meta:
         model = CashReceived
         fields = [
             'id', 'cashier', 'cashier_email', 'cashier_name', 'branch', 'branch_name',
-            'date', 'total_amount', 'entered_by', 'entered_by_email', 'notes',
+            'date', 'total_amount', 'type_of_payment', 'type_of_payment_display',
+            'entered_by', 'entered_by_email', 'notes',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'entered_by']
@@ -349,7 +351,7 @@ class CashReceivedSerializer(serializers.ModelSerializer):
 class CashReceivedCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = CashReceived
-        fields = ['cashier', 'branch', 'date', 'total_amount', 'notes']
+        fields = ['cashier', 'branch', 'date', 'total_amount', 'type_of_payment', 'notes']
     
     def validate(self, data):
         """Validate cash received data"""
@@ -368,3 +370,37 @@ class CashReceivedCreateSerializer(serializers.ModelSerializer):
                     )
         
         return data
+
+
+class CashReceivedUpdateSerializer(serializers.ModelSerializer):
+    """Serializer for updating cash received entries. Only allows updating amount and notes."""
+    class Meta:
+        model = CashReceived
+        fields = ['total_amount', 'notes']
+    
+    def validate_total_amount(self, value):
+        """Validate that total amount is not negative"""
+        if value < 0:
+            raise serializers.ValidationError('Total amount cannot be negative.')
+        return value
+
+
+class ExchangeRateSerializer(serializers.ModelSerializer):
+    current_rate = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        required=True,
+        help_text='Current exchange rate (must be greater than zero)'
+    )
+
+    class Meta:
+        model = ExchangeRate
+        fields = ['current_rate']
+
+    def validate_current_rate(self, value):
+        """Validate that the exchange rate is positive."""
+        if value <= 0:
+            raise serializers.ValidationError('Exchange rate must be greater than zero.')
+        return value
+
+

@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import StockEntry, StockAdjustment, StockTransfer, Supplier, BranchStock, StockTransfer
+from .models import StockEntry, StockAdjustment, StockTransfer, StockTransferItem, Supplier, BranchStock, StockTransfer
 
 
 @admin.register(StockEntry)
@@ -34,4 +34,5 @@ class StockAdjustmentAdmin(admin.ModelAdmin):
 admin.site.register(Supplier)
 admin.site.register(BranchStock)
 admin.site.register(StockTransfer)
+admin.site.register(StockTransferItem)
 

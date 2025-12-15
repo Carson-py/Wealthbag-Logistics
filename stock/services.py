@@ -14,7 +14,7 @@ from reportlab.lib.pagesizes import letter, A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from .models import StockEntry, StockAdjustment, BranchStock, StockTransfer, StockTransferItem, StockEntryGroup
+from .models import StockEntry, StockAdjustment, BranchStock, StockTransfer, StockTransferItem, StockEntryGroup, Supplier
 from products.models import Product
 from organization.models import Warehouse, Branch
 from accounts.models import User, Employee
@@ -36,6 +36,289 @@ def _make_serializable(data: Dict[str, Any]) -> Dict[str, Any]:
         else:
             serializable_data[key] = value
     return serializable_data
+
+
+def _generate_unique_sku_from_name(name: str) -> str:
+    """Generate a simple unique SKU from product name."""
+    base = ''.join(ch for ch in name.upper() if ch.isalnum())[:8] or 'SKU'
+    suffix = str(uuid.uuid4())[:6].upper()
+    sku = f"{base}-{suffix}"
+    attempts = 0
+    while Product.objects.filter(sku=sku).exists() and attempts < 5:
+        suffix = str(uuid.uuid4())[:6].upper()
+        sku = f"{base}-{suffix}"
+        attempts += 1
+    return sku
+
+
+def _safe_decimal(value) -> Optional[Decimal]:
+    if value is None or value == '':
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def import_stock_from_excel(file_obj, warehouse_id: int, created_by=None, notes: str = '') -> Dict[str, Any]:
+    """
+    Import stock into a warehouse from an Excel (.xlsx) file.
+    Expected columns (case-insensitive):
+        product name, description, selling prices, cost per unit, total quantity, supplier name, supplier email address
+    Creates products/suppliers when missing. Description is treated as the unique product key.
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise ValueError('openpyxl is required to import Excel files.') from exc
+
+    wb = load_workbook(file_obj, data_only=True)
+    ws = wb.active
+
+    headers = []
+    for cell in ws[1]:
+        headers.append(str(cell.value).strip().lower() if cell.value is not None else '')
+
+    required_map = {
+        'product name': 'product_name',
+        'description': 'description',
+        'selling prices': 'selling_price',
+        'cost per unit': 'purchase_price',
+        'total quantity': 'quantity',
+        'supplier name': 'supplier_name',
+        'supplier email address': 'supplier_email',
+    }
+
+    header_to_key = {}
+    for idx, header in enumerate(headers):
+        if header in required_map:
+            header_to_key[idx] = required_map[header]
+
+    missing = [col for col, key in required_map.items() if key not in header_to_key.values()]
+    if missing:
+        raise ValueError(f'Missing required columns: {", ".join(missing)}')
+
+    created_entries = []
+    errors = []
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        row_data = {header_to_key[i]: row[i].value for i in header_to_key if i < len(row)}
+        if all(val in (None, '') for val in row_data.values()):
+            continue
+
+        try:
+            product_name = (row_data.get('product_name') or '').strip()
+            description = (row_data.get('description') or '').strip()
+            supplier_name = (row_data.get('supplier_name') or '').strip()
+            supplier_email = (row_data.get('supplier_email') or '').strip()
+
+            selling_price = _safe_decimal(row_data.get('selling_price'))
+            purchase_price = _safe_decimal(row_data.get('purchase_price'))
+            quantity = _safe_decimal(row_data.get('quantity'))
+
+            if not (product_name and description and supplier_name and purchase_price is not None and quantity is not None):
+                raise ValueError('Missing required values in row.')
+
+            # Supplier lookup or create
+            supplier = None
+            if supplier_email:
+                supplier = Supplier.objects.filter(email__iexact=supplier_email).first()
+            if not supplier and supplier_name:
+                supplier = Supplier.objects.filter(name__iexact=supplier_name).first()
+            if not supplier:
+                supplier = Supplier.objects.create(name=supplier_name, email=supplier_email)
+
+            # Product lookup or create (description treated as unique key)
+            product = None
+            if description:
+                product = Product.objects.filter(description__iexact=description).first()
+            if not product and product_name:
+                product = Product.objects.filter(name__iexact=product_name).first()
+            if not product:
+                sku = _generate_unique_sku_from_name(product_name or description or 'SKU')
+                product = Product.objects.create(
+                    sku=sku,
+                    name=product_name or description or sku,
+                    description=description
+                )
+
+            selling_price_final = selling_price if selling_price is not None else purchase_price
+
+            # Check if stock entry already exists for this product in the warehouse
+            existing_entry = StockEntry.objects.filter(
+                product=product,
+                warehouse_id=warehouse_id
+            ).order_by('-received_date', '-created_at').first()
+
+            if existing_entry:
+                # Update existing entry: increment quantity and update prices
+                old_quantity = existing_entry.quantity
+                with transaction.atomic():
+                    existing_entry.quantity += quantity
+                    existing_entry.purchase_price = purchase_price
+                    existing_entry.selling_price = selling_price_final
+                    if supplier:
+                        existing_entry.supplier = supplier
+                    if notes:
+                        existing_entry.notes = f"{existing_entry.notes}\n{notes or f'Imported from Excel row {row_idx}'}".strip()
+                    existing_entry.save()
+                    
+                    # Create adjustment record for the increment
+                    StockAdjustment.objects.create(
+                        product=product,
+                        warehouse_id=warehouse_id,
+                        adjustment_type='addition',
+                        quantity=quantity,
+                        purchase_price=purchase_price,
+                        reason=f'Stock incremented from Excel import: {notes or f"Row {row_idx}"}',
+                        created_by=created_by
+                    )
+                
+                created_entries.append({
+                    'product': product.name,
+                    'quantity': str(quantity),
+                    'purchase_price': str(purchase_price),
+                    'selling_price': str(selling_price_final),
+                    'supplier': supplier.name if supplier else None,
+                    'row': row_idx,
+                    'action': 'updated',
+                    'existing_quantity': str(old_quantity),
+                    'new_quantity': str(existing_entry.quantity),
+                })
+            else:
+                # Create new entry if it doesn't exist
+                add_stock_to_warehouse(
+                    product_id=product.id,
+                    warehouse_id=warehouse_id,
+                    quantity=quantity,
+                    purchase_price=purchase_price,
+                    selling_price=selling_price_final,
+                    supplier_id=supplier.id if supplier else None,
+                    notes=notes or f'Imported from Excel row {row_idx}',
+                    created_by=created_by
+                )
+                created_entries.append({
+                    'product': product.name,
+                    'quantity': str(quantity),
+                    'purchase_price': str(purchase_price),
+                    'selling_price': str(selling_price_final),
+                    'supplier': supplier.name if supplier else None,
+                    'row': row_idx,
+                    'action': 'created',
+                })
+        except Exception as exc:
+            errors.append({'row': row_idx, 'error': str(exc)})
+
+    return {
+        'created': created_entries,
+        'errors': errors,
+        'summary': {
+            'total_rows': ws.max_row - 1,
+            'processed': len(created_entries) + len(errors),
+            'successful': len(created_entries),
+            'failed': len(errors),
+        }
+    }
+
+
+def import_products_from_excel(file_obj, created_by=None, notes: str = '') -> Dict[str, Any]:
+    """
+    Import products (and suppliers) from an Excel (.xlsx) file.
+    Expected columns (case-insensitive):
+        product name, description, selling prices, cost per unit, total quantity, supplier name, supplier email address
+    Description is treated as the unique key for product lookup; falls back to name.
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise ValueError('openpyxl is required to import Excel files.') from exc
+
+    wb = load_workbook(file_obj, data_only=True)
+    ws = wb.active
+
+    headers = []
+    for cell in ws[1]:
+        headers.append(str(cell.value).strip().lower() if cell.value is not None else '')
+
+    required_map = {
+        'product name': 'product_name',
+        'description': 'description',
+        'selling prices': 'selling_price',
+        'cost per unit': 'purchase_price',
+        'total quantity': 'quantity',
+        'supplier name': 'supplier_name',
+        'supplier email address': 'supplier_email',
+    }
+
+    header_to_key = {}
+    for idx, header in enumerate(headers):
+        if header in required_map:
+            header_to_key[idx] = required_map[header]
+
+    missing = [col for col, key in required_map.items() if key not in header_to_key.values()]
+    if missing:
+        raise ValueError(f'Missing required columns: {", ".join(missing)}')
+
+    created_products = []
+    errors = []
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        row_data = {header_to_key[i]: row[i].value for i in header_to_key if i < len(row)}
+        if all(val in (None, '') for val in row_data.values()):
+            continue
+
+        try:
+            product_name = (row_data.get('product_name') or '').strip()
+            description = (row_data.get('description') or '').strip()
+            supplier_name = (row_data.get('supplier_name') or '').strip()
+            supplier_email = (row_data.get('supplier_email') or '').strip()
+
+            if not (product_name or description):
+                raise ValueError('Missing product name/description.')
+
+            # Supplier lookup or create
+            supplier = None
+            if supplier_email:
+                supplier = Supplier.objects.filter(email__iexact=supplier_email).first()
+            if not supplier and supplier_name:
+                supplier = Supplier.objects.filter(name__iexact=supplier_name).first()
+            if not supplier and supplier_name:
+                supplier = Supplier.objects.create(name=supplier_name, email=supplier_email)
+
+            # Product lookup or create (description treated as unique key)
+            product = None
+            if description:
+                product = Product.objects.filter(description__iexact=description).first()
+            if not product and product_name:
+                product = Product.objects.filter(name__iexact=product_name).first()
+            if not product:
+                sku = _generate_unique_sku_from_name(product_name or description or 'SKU')
+                product = Product.objects.create(
+                    sku=sku,
+                    name=product_name or description or sku,
+                    description=description
+                )
+
+            created_products.append({
+                'product': product.name,
+                'supplier': supplier.name if supplier else None,
+                'row': row_idx,
+                'notes': notes,
+            })
+        except Exception as exc:
+            errors.append({'row': row_idx, 'error': str(exc)})
+
+    return {
+        'created': created_products,
+        'errors': errors,
+        'summary': {
+            'total_rows': ws.max_row - 1,
+            'processed': len(created_products) + len(errors),
+            'successful': len(created_products),
+            'failed': len(errors),
+        }
+    }
+
 
 
 def _resolve_reorder_level(explicit_level: Optional[int], original_stock_entry=None, original_branch_stock=None) -> int:
@@ -74,6 +357,29 @@ def _calculate_weighted_purchase_price(entries_used: List[Tuple[Any, Decimal]]) 
     if total_quantity == 0:
         return Decimal('0')
     return total_cost / total_quantity
+
+
+def _calculate_weighted_selling_price(entries_used: List[Tuple[Any, Decimal]]) -> Decimal:
+    """
+    Calculate the weighted average selling price from the source entries used.
+    Selling price now lives on the source stock entry (main warehouse), so we
+    propagate that price to destination stock (e.g., branch) during transfers.
+    """
+    total_quantity = Decimal('0')
+    total_revenue = Decimal('0')
+
+    for entry, quantity_used in entries_used:
+        if quantity_used is None or quantity_used == 0:
+            continue
+        entry_price = getattr(entry, 'selling_price', None)
+        if entry_price is None:
+            continue
+        total_quantity += quantity_used
+        total_revenue += entry_price * quantity_used
+
+    if total_quantity == 0:
+        return Decimal('0')
+    return total_revenue / total_quantity
 
 
 def _preview_purchase_price(
@@ -117,6 +423,50 @@ def _preview_purchase_price(
     return total_cost / total_quantity
 
 
+def _preview_selling_price(
+    product,
+    quantity: Decimal,
+    source_warehouse: Optional[Warehouse] = None,
+    source_branch: Optional[Branch] = None,
+) -> Optional[Decimal]:
+    """
+    Get the weighted average selling price from source stock entries (FIFO).
+    Returns None if no selling price is found in source stock.
+    """
+    if source_warehouse:
+        entries = StockEntry.objects.filter(
+            product=product,
+            warehouse=source_warehouse,
+            quantity__gt=0
+        ).order_by('received_date', 'created_at')
+    elif source_branch:
+        entries = BranchStock.objects.filter(
+            product=product,
+            branch=source_branch,
+            quantity__gt=0
+        ).order_by('received_date', 'created_at')
+    else:
+        return None
+    
+    remaining = quantity
+    total_quantity = Decimal('0')
+    total_revenue = Decimal('0')
+    
+    for entry in entries:
+        if remaining <= 0:
+            break
+        take = entry.quantity if entry.quantity <= remaining else remaining
+        entry_selling_price = getattr(entry, 'selling_price', None)
+        if entry_selling_price is not None:
+            total_quantity += take
+            total_revenue += take * entry_selling_price
+        remaining -= take
+    
+    if total_quantity == 0:
+        return None
+    return total_revenue / total_quantity
+
+
 def generate_unique_batch_number() -> str:
     """
     Generate a unique batch number for stock entries.
@@ -154,6 +504,7 @@ def add_stock_to_warehouse(
     warehouse_id: int,
     quantity: Decimal,
     purchase_price: Decimal,
+    selling_price: Optional[Decimal] = None,
     reorder_level: Optional[int] = None,
     supplier_id: int = None,
     batch_number: str = None,
@@ -174,6 +525,8 @@ def add_stock_to_warehouse(
     if not batch_number:
         batch_number = generate_unique_batch_number()
     
+    selling_price = selling_price if selling_price is not None else purchase_price
+
     with transaction.atomic():
         # Create stock entry
         stock_entry = StockEntry.objects.create(
@@ -182,6 +535,7 @@ def add_stock_to_warehouse(
             quantity=quantity,
             reorder_level=reorder_level,
             purchase_price=purchase_price,
+            selling_price=selling_price,
             supplier_id=supplier_id,
             batch_number=batch_number,
             notes=notes,
@@ -251,6 +605,7 @@ def add_multi_product_stock_to_warehouse(
             if reorder_level is None:
                 reorder_level = 0
             purchase_price = item_data['purchase_price']
+            selling_price = item_data.get('selling_price', purchase_price)
             supplier_id = item_data.get('supplier_id')
             batch_number = item_data.get('batch_number')
             item_notes = item_data.get('notes', '')
@@ -266,6 +621,7 @@ def add_multi_product_stock_to_warehouse(
                 quantity=quantity,
                 reorder_level=reorder_level,
                 purchase_price=purchase_price,
+                selling_price=selling_price,
                 supplier_id=supplier_id,
                 batch_number=batch_number,
                 notes=item_notes,
@@ -882,9 +1238,6 @@ def create_stock_transfer(
         if available < quantity:
             raise ValueError(f'Insufficient stock in branch. Available: {available}, Requested: {quantity}')
     
-    if destination_branch and selling_price is None:
-        raise ValueError('Selling price is required when transferring stock to a branch.')
-
     preview_purchase_price = _preview_purchase_price(
         product=product,
         quantity=quantity,
@@ -893,6 +1246,17 @@ def create_stock_transfer(
     )
     if preview_purchase_price == 0:
         raise ValueError('Unable to determine purchase price for the selected stock. Please ensure source stock has purchase prices.')
+
+    # Automatically get selling_price from source stock entry if not provided and transferring to a branch
+    if selling_price is None and transfer_type in ['warehouse_to_branch', 'branch_to_branch']:
+        selling_price = _preview_selling_price(
+            product=product,
+            quantity=quantity,
+            source_warehouse=source_warehouse,
+            source_branch=source_branch
+        )
+        if selling_price is None:
+            raise ValueError('Unable to determine selling price from source stock. Please ensure source stock has selling prices or provide selling_price explicitly.')
 
     with transaction.atomic():
         # reference_number will be auto-generated in save() if not provided
@@ -1001,9 +1365,6 @@ def create_multi_product_stock_transfer(
             item_reorder_level = item_data.get('reorder_level')
             item_selling_price = item_data.get('selling_price')
             
-            if destination_branch and item_selling_price is None:
-                raise ValueError('Selling price is required for each item when transferring stock to a branch.')
-            
             # Check available stock at source
             if source_warehouse:
                 available = StockEntry.objects.filter(
@@ -1032,6 +1393,17 @@ def create_multi_product_stock_transfer(
             if preview_purchase_price == 0:
                 raise ValueError(f'Unable to determine purchase price for {product.name}. Ensure source stock has purchase prices.')
             
+            # Automatically get selling_price from source stock entry if not provided and transferring to a branch
+            if item_selling_price is None and transfer_type in ['warehouse_to_branch', 'branch_to_branch']:
+                item_selling_price = _preview_selling_price(
+                    product=product,
+                    quantity=quantity,
+                    source_warehouse=source_warehouse,
+                    source_branch=source_branch
+                )
+                if item_selling_price is None:
+                    raise ValueError(f'Unable to determine selling price for {product.name} from source stock. Please ensure source stock has selling prices or provide selling_price explicitly.')
+            
             # Create transfer item
             StockTransferItem.objects.create(
                 transfer=transfer,
@@ -1053,6 +1425,179 @@ def create_multi_product_stock_transfer(
         pass
     
     return transfer
+
+
+def _send_transfer_completion_notification_email(transfer: StockTransfer) -> None:
+    """
+    Send email notification to branch manager when a stock transfer is completed/approved.
+    This is sent in addition to the invoice email.
+    """
+    api_key = getattr(settings, 'MAILJET_API_KEY', '')
+    api_secret = getattr(settings, 'MAILJET_API_SECRET', '')
+    if not api_key or not api_secret:
+        return  # Silently fail if email is not configured
+    
+    # Only send to branch managers when destination is a branch
+    if not transfer.destination_branch:
+        return
+    
+    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@decormasters.com')
+    company_name = getattr(settings, 'COMPANY_NAME', 'Decor Masters')
+    mailjet = Client(auth=(api_key, api_secret), version='v3.1')
+    
+    # Get branch managers for destination branch
+    branch_managers = User.objects.filter(
+        role='branch_manager',
+        is_active=True,
+        account_status='active',
+        profile__branch=transfer.destination_branch
+    ).prefetch_related('profile').distinct()
+    
+    recipients = []
+    for manager in branch_managers:
+        employee = manager.profile.first() if hasattr(manager, 'profile') else None
+        if employee and employee.branch == transfer.destination_branch:
+            recipients.append({
+                'email': manager.email,
+                'name': employee.get_full_name() if employee and employee.get_full_name() else manager.email,
+            })
+    
+    if not recipients:
+        return  # No recipients to notify
+    
+    # Get transfer details
+    transfer_type_display = transfer.get_transfer_type_display()
+    source_name = transfer.source_warehouse.name if transfer.source_warehouse else (transfer.source_branch.name if transfer.source_branch else 'Unknown')
+    destination_name = transfer.destination_branch.name
+    reference_number = transfer.reference_number
+    completed_by_name = transfer.completed_by.email if transfer.completed_by else 'System'
+    
+    # Get product details
+    items = transfer.items.all() if hasattr(transfer, 'items') else []
+    items_summary = ""
+    total_quantity = Decimal('0')
+    for item in items:
+        items_summary += f"<tr><td>{item.product.name} ({item.product.sku})</td><td style='text-align: right;'>{item.quantity}</td></tr>"
+        total_quantity += item.quantity
+    
+    # Prepare email content
+    subject = f'Stock Transfer Approved - {reference_number}'
+    
+    html_content = f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 800px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #10b981;">✅ Stock Transfer Approved</h2>
+                <p>Dear Branch Manager,</p>
+                <p>Your stock transfer request has been approved and completed successfully.</p>
+                
+                <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                    <tr>
+                        <td style="padding: 8px; font-weight: bold; width: 200px;">Transfer Reference:</td>
+                        <td style="padding: 8px;">{reference_number}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; font-weight: bold;">Transfer Type:</td>
+                        <td style="padding: 8px;">{transfer_type_display}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; font-weight: bold;">From:</td>
+                        <td style="padding: 8px;">{source_name}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; font-weight: bold;">To:</td>
+                        <td style="padding: 8px;">{destination_name}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; font-weight: bold;">Completed By:</td>
+                        <td style="padding: 8px;">{completed_by_name}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; font-weight: bold;">Status:</td>
+                        <td style="padding: 8px;"><strong style="color: #10b981;">Completed</strong></td>
+                    </tr>
+                </table>
+                
+                <h3 style="color: #10b981; margin-top: 30px;">Items Received:</h3>
+                <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                    <thead>
+                        <tr style="background-color: #10b981; color: white;">
+                            <th style="padding: 10px; text-align: left;">Product</th>
+                            <th style="padding: 10px; text-align: right;">Quantity</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {items_summary}
+                    </tbody>
+                </table>
+                
+                {f'<p><strong>Notes:</strong> {transfer.notes}</p>' if transfer.notes else ''}
+                
+                <p style="color: #065f46; background-color: #d1fae5; padding: 15px; border-left: 4px solid #10b981; margin: 20px 0;">
+                    <strong>✅ Transfer Complete:</strong> The stock has been successfully transferred to your branch. 
+                    Please find the detailed invoice attached in a separate email.
+                </p>
+                
+                <p>Regards,<br>{company_name}</p>
+            </div>
+        </body>
+    </html>
+    """
+    
+    text_content = f"""
+    Stock Transfer Approved
+    
+    Dear Branch Manager,
+    
+    Your stock transfer request has been approved and completed successfully.
+    
+    Transfer Reference: {reference_number}
+    Transfer Type: {transfer_type_display}
+    From: {source_name}
+    To: {destination_name}
+    Completed By: {completed_by_name}
+    Status: Completed
+    
+    Items Received:
+    """
+    
+    for item in items:
+        text_content += f"\n- {item.product.name} ({item.product.sku}): {item.quantity}"
+    
+    text_content += f"\n\nPlease find the detailed invoice attached in a separate email.\n\nRegards,\n{company_name}"
+    
+    # Send email to all branch managers
+    for recipient in recipients:
+        data = {
+            'Messages': [
+                {
+                    'From': {
+                        'Email': from_email,
+                        'Name': company_name
+                    },
+                    'To': [
+                        {
+                            'Email': recipient['email'],
+                            'Name': recipient['name']
+                        }
+                    ],
+                    'Subject': subject,
+                    'TextPart': text_content,
+                    'HTMLPart': html_content
+                }
+            ]
+        }
+        
+        try:
+            result = mailjet.send.create(data=data)
+            if result.status_code not in (200, 201):
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f'Failed to send transfer completion notification email: Status {result.status_code}')
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f'Error sending transfer completion notification email: {str(e)}')
 
 
 def complete_stock_transfer(transfer_id: int, completed_by=None) -> StockTransfer:
@@ -1084,14 +1629,19 @@ def complete_stock_transfer(transfer_id: int, completed_by=None) -> StockTransfe
         transfer.completed_at = timezone.now()
         transfer.save()
         
-        # Send invoice PDF via email to the destination manager
+        # Send notifications to destination manager (branch manager if destination is branch)
         try:
+            # Send approval/completion notification to branch manager if destination is a branch
+            if transfer.destination_branch:
+                _send_transfer_completion_notification_email(transfer)
+            
+            # Send invoice PDF via email to the destination manager
             send_transfer_invoice_email(transfer)
         except Exception as e:
             # Log error but don't fail the transfer completion
             import logging
             logger = logging.getLogger(__name__)
-            logger.error(f'Failed to send transfer invoice email: {str(e)}')
+            logger.error(f'Failed to send transfer notification/invoice email: {str(e)}')
     
     return transfer
 
@@ -1240,10 +1790,12 @@ def _complete_single_product_transfer(transfer: StockTransfer, completed_by=None
             )
         
         elif transfer.destination_branch:
-            # Add to branch - need to get selling price from source or use a default
-            selling_price = transfer.selling_price
+            # Add to branch - use selling price from source stock entries
+            selling_price = _calculate_weighted_selling_price(original_entries_used)
+            if selling_price == 0:
+                selling_price = transfer.selling_price
             
-            # Try to get selling price from source branch stock if available
+            # Try to get selling price from source branch stock if available (for branch-to-branch)
             if selling_price is None and transfer.source_branch:
                 source_stock = BranchStock.objects.filter(
                     product=transfer.product,
@@ -1255,52 +1807,32 @@ def _complete_single_product_transfer(transfer: StockTransfer, completed_by=None
             if selling_price is None:
                 selling_price = destination_purchase_price
             
-            # Check if stock already exists in the branch with same purchase price AND selling price
-            # Only increment if BOTH prices match exactly, otherwise create a new entry
-            existing_stock = None
+            # Always increment existing branch stock for this product, and update prices to latest values
+            existing_stock = BranchStock.objects.filter(
+                product=transfer.product,
+                branch=transfer.destination_branch,
+                quantity__gt=0
+            ).order_by('-received_date', '-created_at').first()
             
-            # First, try to find existing stock with matching purchase price, selling price, and batch number (if available)
+            transfer_notes = f'Stock replenished via transfer from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
             if original_batch_str:
-                existing_stock = BranchStock.objects.filter(
-                    product=transfer.product,
-                    branch=transfer.destination_branch,
-                    purchase_price=destination_purchase_price,
-                    selling_price=selling_price,
-                    original_batch_number=original_batch_str,
-                    quantity__gt=0
-                ).first()
-            
-            # If not found by batch, try to find by purchase price and selling price only
-            if not existing_stock:
-                existing_stock = BranchStock.objects.filter(
-                    product=transfer.product,
-                    branch=transfer.destination_branch,
-                    purchase_price=destination_purchase_price,
-                    selling_price=selling_price,
-                    quantity__gt=0
-                ).order_by('-received_date', '-created_at').first()
+                transfer_notes += f' (Original batch: {original_batch_str})'
+            if transfer.notes:
+                transfer_notes += f': {transfer.notes}'
             
             if existing_stock:
-                # Increment existing stock entry
                 existing_stock.quantity += transfer.quantity
-                transfer_notes = f'Stock replenished via transfer from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
-                if original_batch_str:
-                    transfer_notes += f' (Original batch: {original_batch_str})'
-                if transfer.notes:
-                    transfer_notes += f': {transfer.notes}'
+                existing_stock.purchase_price = destination_purchase_price
+                existing_stock.selling_price = selling_price
+                existing_stock.reorder_level = destination_reorder_level
                 if existing_stock.notes:
                     existing_stock.notes += f'\n{transfer_notes}'
                 else:
                     existing_stock.notes = transfer_notes
-                existing_stock.save()
+                existing_stock.save(update_fields=['quantity', 'purchase_price', 'selling_price', 'reorder_level', 'notes', 'updated_at'])
             else:
                 # Create new stock entry
                 new_batch_number = generate_unique_batch_number()
-                transfer_notes = f'Transferred from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
-                if original_batch_str:
-                    transfer_notes += f' (Original batch: {original_batch_str})'
-                if transfer.notes:
-                    transfer_notes += f': {transfer.notes}'
                 
                 BranchStock.objects.create(
                     product=transfer.product,
@@ -1458,7 +1990,10 @@ def _complete_multi_product_transfer(transfer: StockTransfer, items, completed_b
             )
         
         elif transfer.destination_branch:
-            selling_price = item.selling_price
+            # Use selling price from source entries (main warehouse) when available
+            selling_price = _calculate_weighted_selling_price(original_entries_used)
+            if selling_price == 0:
+                selling_price = item.selling_price
             if selling_price is None and transfer.source_branch:
                 source_stock = BranchStock.objects.filter(
                     product=item.product,
@@ -1470,56 +2005,34 @@ def _complete_multi_product_transfer(transfer: StockTransfer, items, completed_b
             if selling_price is None:
                 selling_price = destination_purchase_price
             
-            # Check if stock already exists in the branch with same purchase price AND selling price
-            # Only increment if BOTH prices match exactly, otherwise create a new entry
-            existing_stock = None
+            # Always increment existing branch stock for this product and update to new prices
+            existing_stock = BranchStock.objects.filter(
+                product=item.product,
+                branch=transfer.destination_branch,
+                quantity__gt=0
+            ).order_by('-received_date', '-created_at').first()
             
-            # First, try to find existing stock with matching purchase price, selling price, and batch number (if available)
+            transfer_notes = f'Stock replenished via transfer from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
             if original_batch_str:
-                existing_stock = BranchStock.objects.filter(
-                    product=item.product,
-                    branch=transfer.destination_branch,
-                    purchase_price=destination_purchase_price,
-                    selling_price=selling_price,
-                    original_batch_number=original_batch_str,
-                    quantity__gt=0
-                ).first()
-            
-            # If not found by batch, try to find by purchase price and selling price only
-            if not existing_stock:
-                existing_stock = BranchStock.objects.filter(
-                    product=item.product,
-                    branch=transfer.destination_branch,
-                    purchase_price=destination_purchase_price,
-                    selling_price=selling_price,
-                    quantity__gt=0
-                ).order_by('-received_date', '-created_at').first()
+                transfer_notes += f' (Original batch: {original_batch_str})'
+            if item.notes:
+                transfer_notes += f': {item.notes}'
+            if transfer.notes:
+                transfer_notes += f' | Transfer: {transfer.notes}'
             
             if existing_stock:
-                # Increment existing stock entry
                 existing_stock.quantity += item.quantity
-                transfer_notes = f'Stock replenished via transfer from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
-                if original_batch_str:
-                    transfer_notes += f' (Original batch: {original_batch_str})'
-                if item.notes:
-                    transfer_notes += f': {item.notes}'
-                if transfer.notes:
-                    transfer_notes += f' | Transfer: {transfer.notes}'
+                existing_stock.purchase_price = destination_purchase_price
+                existing_stock.selling_price = selling_price
+                existing_stock.reorder_level = destination_reorder_level
                 if existing_stock.notes:
                     existing_stock.notes += f'\n{transfer_notes}'
                 else:
                     existing_stock.notes = transfer_notes
-                existing_stock.save()
+                existing_stock.save(update_fields=['quantity', 'purchase_price', 'selling_price', 'reorder_level', 'notes', 'updated_at'])
             else:
                 # Create new stock entry
                 new_batch_number = generate_unique_batch_number()
-                transfer_notes = f'Transferred from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
-                if original_batch_str:
-                    transfer_notes += f' (Original batch: {original_batch_str})'
-                if item.notes:
-                    transfer_notes += f': {item.notes}'
-                if transfer.notes:
-                    transfer_notes += f' | Transfer: {transfer.notes}'
                 
                 BranchStock.objects.create(
                     product=item.product,
@@ -1688,6 +2201,7 @@ def _send_stock_transfer_notification_email(transfer: StockTransfer) -> None:
                 })
     
     # 2. Warehouse manager for the source warehouse (if source is a warehouse)
+    # This is the primary recipient - warehouse manager needs to approve/process the transfer
     if transfer.source_warehouse:
         warehouse_managers = User.objects.filter(
             role='warehouse_manager',
@@ -2211,4 +2725,239 @@ def send_transfer_invoice_email(transfer: StockTransfer) -> None:
         import logging
         logger = logging.getLogger(__name__)
         logger.error(f'Error sending transfer invoice email: {str(e)}')
+
+
+def import_stock_transfers_from_excel(
+    file_obj,
+    transfer_type: str,
+    source_warehouse_id: int = None,
+    source_branch_id: int = None,
+    destination_warehouse_id: int = None,
+    destination_branch_id: int = None,
+    reference_number: str = None,
+    notes: str = '',
+    created_by=None
+) -> Dict[str, Any]:
+    """
+    Import stock transfers from an Excel (.xlsx) file.
+    
+    transfer_type, source, and destination must be provided as parameters.
+    Excel file should only contain product information.
+    
+    Expected Excel columns (case-insensitive):
+        - product_name: Product name (required)
+        - description: Product description (optional, but recommended if multiple products share the same name)
+        - quantity: Quantity to transfer (required)
+        - selling_price: Selling price (optional, auto-filled for branch transfers)
+        - reorder_level: Reorder level (optional)
+        - item_notes: Notes for individual item (optional)
+    
+    Note: If multiple products have the same name, provide the description to uniquely identify the product.
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise ValueError('openpyxl is required to import Excel files.') from exc
+
+    wb = load_workbook(file_obj, data_only=True)
+    ws = wb.active
+
+    headers = []
+    for cell in ws[1]:
+        headers.append(str(cell.value).strip().lower() if cell.value is not None else '')
+
+    # Validate required parameters based on transfer_type
+    if transfer_type == 'warehouse_to_warehouse':
+        if not source_warehouse_id:
+            raise ValueError('source_warehouse_id is required for warehouse_to_warehouse transfers')
+        if not destination_warehouse_id:
+            raise ValueError('destination_warehouse_id is required for warehouse_to_warehouse transfers')
+    elif transfer_type == 'warehouse_to_branch':
+        if not source_warehouse_id:
+            raise ValueError('source_warehouse_id is required for warehouse_to_branch transfers')
+        if not destination_branch_id:
+            raise ValueError('destination_branch_id is required for warehouse_to_branch transfers')
+    elif transfer_type == 'branch_to_branch':
+        if not source_branch_id:
+            raise ValueError('source_branch_id is required for branch_to_branch transfers')
+        if not destination_branch_id:
+            raise ValueError('destination_branch_id is required for branch_to_branch transfers')
+    elif transfer_type == 'branch_to_warehouse':
+        if not source_branch_id:
+            raise ValueError('source_branch_id is required for branch_to_warehouse transfers')
+        if not destination_warehouse_id:
+            raise ValueError('destination_warehouse_id is required for branch_to_warehouse transfers')
+    else:
+        raise ValueError(f'Invalid transfer_type: {transfer_type}')
+
+    # Map Excel headers to internal keys (only product-related fields)
+    header_to_key = {}
+    for idx, header in enumerate(headers):
+        header_lower = header.lower().strip()
+        if header_lower in ['product_name', 'product name', 'product']:
+            header_to_key[idx] = 'product_name'
+        elif header_lower in ['description', 'desc']:
+            header_to_key[idx] = 'description'
+        elif header_lower in ['quantity', 'qty']:
+            header_to_key[idx] = 'quantity'
+        elif header_lower in ['selling_price', 'selling price', 'price']:
+            header_to_key[idx] = 'selling_price'
+        elif header_lower in ['reorder_level', 'reorder level']:
+            header_to_key[idx] = 'reorder_level'
+        elif header_lower in ['item_notes', 'item notes', 'notes']:
+            header_to_key[idx] = 'item_notes'
+
+    items_data = []
+    errors = []
+
+    # Collect all products from Excel into items_data
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        row_data = {header_to_key[i]: row[i].value for i in header_to_key if i < len(row)}
+        
+        # Skip empty rows
+        if all(val in (None, '') for val in row_data.values()):
+            continue
+
+        try:
+            # Get product identifier
+            product_name = (row_data.get('product_name') or '').strip()
+            description = (row_data.get('description') or '').strip()
+            
+            if not product_name:
+                raise ValueError('product_name is required')
+            
+            # Find product - match by both name and description if both are provided
+            # This handles cases where multiple products have the same name
+            product = None
+            if product_name and description:
+                # Match by both name and description (exact match)
+                product = Product.objects.filter(
+                    name__iexact=product_name,
+                    description__iexact=description
+                ).first()
+                
+                # If not found with both, try with name only (in case description doesn't match exactly)
+                if not product:
+                    products_by_name = Product.objects.filter(name__iexact=product_name)
+                    if products_by_name.count() > 1:
+                        raise ValueError(
+                            f'Multiple products found with name "{product_name}". '
+                            f'Please provide description to uniquely identify the product. '
+                            f'Available descriptions: {", ".join([p.description or "(no description)" for p in products_by_name])}'
+                        )
+                    product = products_by_name.first()
+            elif product_name:
+                # Only name provided - check if multiple products exist with same name
+                products_by_name = Product.objects.filter(name__iexact=product_name)
+                if products_by_name.count() > 1:
+                    raise ValueError(
+                        f'Multiple products found with name "{product_name}". '
+                        f'Please provide description to uniquely identify the product. '
+                        f'Available descriptions: {", ".join([p.description or "(no description)" for p in products_by_name])}'
+                    )
+                product = products_by_name.first()
+            
+            if not product:
+                raise ValueError(f'Product not found: {product_name}' + (f' with description: {description}' if description else ''))
+            
+            # Get quantity
+            quantity = _safe_decimal(row_data.get('quantity'))
+            if quantity is None or quantity <= 0:
+                raise ValueError('Valid quantity is required')
+            
+            # Get optional fields
+            item_selling_price = _safe_decimal(row_data.get('selling_price'))
+            item_reorder_level = _safe_decimal(row_data.get('reorder_level'))
+            item_notes = (row_data.get('item_notes') or '').strip()
+            
+            # Add to items_data for multi-product transfer
+            item_data = {
+                'product_id': product.id,
+                'quantity': quantity,
+            }
+            
+            if item_selling_price is not None:
+                item_data['selling_price'] = item_selling_price
+            if item_reorder_level is not None:
+                item_data['reorder_level'] = item_reorder_level
+            if item_notes:
+                item_data['notes'] = item_notes
+            
+            items_data.append(item_data)
+            
+        except Exception as exc:
+            errors.append({
+                'row': row_idx,
+                'error': str(exc),
+                'product': product_name or 'Unknown',
+            })
+    
+    # If no valid items, return error
+    if not items_data:
+        return {
+            'created': [],
+            'errors': errors,
+            'summary': {
+                'total_rows': ws.max_row - 1,
+                'processed': len(errors),
+                'successful': 0,
+                'failed': len(errors),
+            }
+        }
+    
+    # Create single transfer with all products
+    try:
+        transfer = create_multi_product_stock_transfer(
+            transfer_type=transfer_type,
+            items_data=items_data,
+            source_warehouse_id=source_warehouse_id,
+            source_branch_id=source_branch_id,
+            destination_warehouse_id=destination_warehouse_id,
+            destination_branch_id=destination_branch_id,
+            reference_number=reference_number or None,
+            notes=notes or 'Imported from Excel',
+            created_by=created_by
+        )
+        
+        # Prepare response with all items
+        created_items = []
+        for item in transfer.items.all():
+            created_items.append({
+                'product': item.product.name,
+                'product_sku': item.product.sku,
+                'quantity': str(item.quantity),
+            })
+        
+        return {
+            'created': [{
+                'transfer_id': transfer.id,
+                'reference_number': transfer.reference_number,
+                'transfer_type': transfer_type,
+                'items': created_items,
+                'total_items': len(created_items),
+            }],
+            'errors': errors,
+            'summary': {
+                'total_rows': ws.max_row - 1,
+                'processed': len(items_data) + len(errors),
+                'successful': len(items_data),
+                'failed': len(errors),
+            }
+        }
+    except Exception as exc:
+        # If transfer creation fails, add to errors
+        return {
+            'created': [],
+            'errors': errors + [{
+                'row': 'all',
+                'error': f'Failed to create transfer: {str(exc)}',
+                'product': 'Multiple products',
+            }],
+            'summary': {
+                'total_rows': ws.max_row - 1,
+                'processed': len(items_data) + len(errors),
+                'successful': 0,
+                'failed': len(items_data) + len(errors),
+            }
+        }
 
