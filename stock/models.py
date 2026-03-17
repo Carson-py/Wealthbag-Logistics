@@ -171,6 +171,7 @@ class BranchStock(models.Model):
     quantity = models.DecimalField(max_digits=12, decimal_places=2)
     purchase_price = models.DecimalField(max_digits=16, decimal_places=8, verbose_name='Purchase Price Per Unit')
     selling_price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name='Selling Price Per Unit')
+    reserved_quantity = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name='Reserved Quantity')
     reorder_level = models.IntegerField(default = 0)
     batch_number = models.CharField(max_length=100, unique=True, blank=False, verbose_name='Batch')
     received_date = models.DateTimeField(default=timezone.now, verbose_name='Date Received')
@@ -210,6 +211,11 @@ class BranchStock(models.Model):
     def total_cost(self):
         """Calculate total cost for this branch stock entry"""
         return self.quantity * self.purchase_price
+
+    @property
+    def available_quantity_for_sale(self):
+        """Calculate available quantity for this branch stock entry"""
+        return self.quantity - self.reserved_quantity
 
 
 # Model to store the stock transfer process from warehouse to warehouse, warehouse to branch, branch to branch and branch to warehouse
@@ -266,6 +272,7 @@ class StockTransfer(models.Model):
     completed_by = models.ForeignKey('accounts.User', on_delete=models.SET_NULL, null=True, blank=True,
                                      related_name='completed_transfers', verbose_name='Completed By')
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     
     class Meta:
@@ -375,6 +382,7 @@ class StockTransferItem(models.Model):
     batch_number = models.CharField(max_length=100, blank=True, verbose_name='Batch Number')
     notes = models.TextField(blank=True, verbose_name='Item Notes')
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
         verbose_name = 'Stock Transfer Item'

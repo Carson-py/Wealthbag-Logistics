@@ -25,6 +25,7 @@ urlpatterns = [
     # Cash received and variance
     path('cash-received/', views.CashReceivedListCreateView.as_view(), name='cash-received-list-create'),
     path('cash-received/<int:pk>/', views.CashReceivedListCreateView.as_view(), name='cash-received-detail'),
+    path('cash-received/summary/', views.CashReceivedSummary.as_view(), name='cash-received-summary'),
     path('cash-variance/', views.CashVarianceView.as_view(), name='cash-variance'),
 
     # Exchange rate

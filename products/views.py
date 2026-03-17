@@ -555,7 +555,7 @@ class RegenerateBarcodeView(APIView):
         
         # Check permission for bulk regeneration
         if regenerate_all:
-            if request.user.role not in ['admin', 'owner']:
+            if request.user.role not in ['admin', 'owner', 'cashier', 'branch_manager']:
                 return Response(
                     {'error': 'Admin permission required to regenerate all barcodes'},
                     status=status.HTTP_403_FORBIDDEN

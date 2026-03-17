@@ -69,7 +69,7 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
         model = StockAdjustment
         fields = [
             'id', 'product', 'product_name', 'product_sku', 'warehouse', 'warehouse_name',
-            'adjustment_type', 'quantity', 'purchase_price', 'reason', 'reference_number',
+            'adjustment_type', 'quantity', 'product_description', 'purchase_price', 'reason', 'reference_number',
             'created_by', 'created_by_email', 'created_at'
         ]
         read_only_fields = ['id', 'created_at']
@@ -206,7 +206,7 @@ class BranchStockSerializer(serializers.ModelSerializer):
         model = BranchStock
         fields = [
             'id', 'product', 'product_name', 'product_sku', 'branch', 'branch_name', 
-            'warehouse_name', 'supplier', 'supplier_name', 'quantity', 'purchase_price', 
+            'warehouse_name', 'supplier', 'supplier_name', 'quantity', 'reserved_quantity', 'available_quantity_for_sale', 'purchase_price', 
             'selling_price', 'total_cost', 'batch_number', 'original_batch_number',
             'received_date', 'notes', 'is_initial_stock', 'source_transfer', 'source_transfer_reference',
             'original_stock_entry', 'original_stock_entry_id', 'original_branch_stock', 'original_branch_stock_id',

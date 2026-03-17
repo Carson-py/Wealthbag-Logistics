@@ -1194,6 +1194,223 @@ class CashReceivedListCreateView(APIView):
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+class CashReceivedSummary(APIView):
+    permission_classes = [IsAuthenticated]
+    
+    @swagger_auto_schema(
+        manual_parameters=[
+            openapi.Parameter('start_date', openapi.IN_QUERY, type=openapi.TYPE_STRING, format='date',
+                            description='Start date for filtering (YYYY-MM-DD). Optional. If not provided, returns all-time data.'),
+            openapi.Parameter('end_date', openapi.IN_QUERY, type=openapi.TYPE_STRING, format='date',
+                            description='End date for filtering (YYYY-MM-DD). Optional. If not provided, returns all-time data.'),
+            openapi.Parameter('cashier_id', openapi.IN_QUERY, type=openapi.TYPE_INTEGER,
+                            description='Filter by cashier ID (optional)'),
+            openapi.Parameter('branch_id', openapi.IN_QUERY, type=openapi.TYPE_INTEGER,
+                            description='Filter by branch ID (optional)'),
+        ],
+        responses={200: 'Cash received summary with totals in USD'}
+    )
+    def get(self, request):
+        """Calculate total cash received, converting ZIG amounts to USD."""
+        from django.utils.dateparse import parse_date as parse_date_func
+        from decimal import Decimal
+        
+        # Get and validate date parameters (optional)
+        start_date_str = request.query_params.get('start_date')
+        end_date_str = request.query_params.get('end_date')
+        
+        start_date = None
+        end_date = None
+        
+        if start_date_str:
+            start_date = parse_date_func(start_date_str)
+            if not start_date:
+                return Response(
+                    {'detail': 'Invalid start_date format. Use YYYY-MM-DD.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        if end_date_str:
+            end_date = parse_date_func(end_date_str)
+            if not end_date:
+                return Response(
+                    {'detail': 'Invalid end_date format. Use YYYY-MM-DD.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        # Validate date range if both dates are provided
+        if start_date and end_date and end_date < start_date:
+            return Response(
+                {'detail': 'end_date must be greater than or equal to start_date.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get optional filters
+        cashier_id = request.query_params.get('cashier_id')
+        branch_id = request.query_params.get('branch_id')
+        
+        # Build query
+        cash_received_query = CashReceived.objects.select_related('cashier', 'branch', 'entered_by').all()
+        
+        # Apply date filters if provided
+        if start_date:
+            cash_received_query = cash_received_query.filter(date__gte=start_date)
+        if end_date:
+            cash_received_query = cash_received_query.filter(date__lte=end_date)
+        
+        # Apply role-based filtering
+        if request.user.role in ['branch_manager', 'cashier']:
+            profile = getattr(request.user, 'profile', None)
+            branch = None
+            if profile:
+                employee = profile.first()
+                if employee:
+                    branch = employee.branch
+            if branch:
+                cash_received_query = cash_received_query.filter(branch=branch)
+            else:
+                cash_received_query = cash_received_query.none()
+        
+        # Apply optional filters
+        if cashier_id:
+            try:
+                cash_received_query = cash_received_query.filter(cashier_id=int(cashier_id))
+            except ValueError:
+                return Response(
+                    {'detail': 'cashier_id must be an integer.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        if branch_id:
+            try:
+                cash_received_query = cash_received_query.filter(branch_id=int(branch_id))
+            except ValueError:
+                return Response(
+                    {'detail': 'branch_id must be an integer.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        # Get all cash received entries
+        cash_received_entries = list(cash_received_query.all())
+        
+        # Calculate totals, converting ZIG to USD
+        total_cash_received_usd = Decimal('0')
+        total_cash_received_zig = Decimal('0')
+        total_cash_received_zig_usd = Decimal('0')
+        
+        # Breakdown by payment type
+        breakdown_by_type = {}
+        
+        # Breakdown by cashier
+        breakdown_by_cashier = {}
+        
+        for entry in cash_received_entries:
+            amount = entry.total_amount
+            payment_type = entry.type_of_payment
+            
+            # Convert to USD
+            amount_usd = services.convert_zig_to_usd(amount, payment_type)
+            
+            # Update totals
+            if services.is_zig_payment_method(payment_type):
+                total_cash_received_zig += amount
+                total_cash_received_zig_usd += amount_usd
+            else:
+                total_cash_received_usd += amount_usd
+            
+            # Update breakdown by payment type
+            if payment_type not in breakdown_by_type:
+                breakdown_by_type[payment_type] = {
+                    'total_amount': Decimal('0'),
+                    'total_amount_usd': Decimal('0'),
+                    'count': 0
+                }
+            
+            breakdown_by_type[payment_type]['total_amount'] += amount
+            breakdown_by_type[payment_type]['total_amount_usd'] += amount_usd
+            breakdown_by_type[payment_type]['count'] += 1
+            
+            # Update breakdown by cashier
+            if entry.cashier:
+                cashier_id = entry.cashier.id
+                if cashier_id not in breakdown_by_cashier:
+                    # Get cashier information
+                    cashier_email = entry.cashier.email
+                    cashier_name = None
+                    profile = getattr(entry.cashier, 'profile', None)
+                    if profile:
+                        employee = profile.first()
+                        if employee:
+                            cashier_name = f"{employee.first_name} {employee.last_name}".strip()
+                    
+                    breakdown_by_cashier[cashier_id] = {
+                        'cashier_id': cashier_id,
+                        'cashier_email': cashier_email,
+                        'cashier_name': cashier_name,
+                        'total_usd': Decimal('0'),
+                        'total_zig': Decimal('0'),
+                        'total_zig_usd': Decimal('0'),
+                        'grand_total_usd': Decimal('0'),
+                        'entry_count': 0
+                    }
+                
+                # Update cashier totals
+                if services.is_zig_payment_method(payment_type):
+                    breakdown_by_cashier[cashier_id]['total_zig'] += amount
+                    breakdown_by_cashier[cashier_id]['total_zig_usd'] += amount_usd
+                else:
+                    breakdown_by_cashier[cashier_id]['total_usd'] += amount_usd
+                
+                breakdown_by_cashier[cashier_id]['grand_total_usd'] += amount_usd
+                breakdown_by_cashier[cashier_id]['entry_count'] += 1
+        
+        # Calculate grand total in USD
+        grand_total_usd = total_cash_received_usd + total_cash_received_zig_usd
+        
+        # Convert Decimal to float for JSON serialization
+        result = {
+            'total_entries': len(cash_received_entries),
+            'total_cash_received_usd': float(total_cash_received_usd),
+            'total_cash_received_zig': float(total_cash_received_zig),
+            'total_cash_received_zig_usd': float(total_cash_received_zig_usd),
+            'grand_total_usd': float(grand_total_usd),
+            'breakdown_by_payment_type': {
+                payment_type: {
+                    'total_amount': float(data['total_amount']),
+                    'total_amount_usd': float(data['total_amount_usd']),
+                    'count': data['count']
+                }
+                for payment_type, data in breakdown_by_type.items()
+            },
+            'breakdown_by_cashier': [
+                {
+                    'cashier_id': data['cashier_id'],
+                    'cashier_email': data['cashier_email'],
+                    'cashier_name': data['cashier_name'],
+                    'total_usd': float(data['total_usd']),
+                    'total_zig': float(data['total_zig']),
+                    'total_zig_usd': float(data['total_zig_usd']),
+                    'grand_total_usd': float(data['grand_total_usd']),
+                    'entry_count': data['entry_count']
+                }
+                for data in breakdown_by_cashier.values()
+            ]
+        }
+        
+        # Add date filter info if provided
+        if start_date_str:
+            result['start_date'] = start_date_str
+        if end_date_str:
+            result['end_date'] = end_date_str
+        
+        # Add filter info if provided
+        if cashier_id:
+            result['cashier_id'] = int(cashier_id)
+        if branch_id:
+            result['branch_id'] = int(branch_id)
+        
+        return Response(result, status=status.HTTP_200_OK)
+    
 class CashVarianceView(APIView):
     permission_classes = [IsAuthenticated]
     

@@ -13,6 +13,7 @@ urlpatterns = [
     path('api/shared/', include('shared.urls')),
     path('api/accounting/', include('accounting.urls')),
     path('api/analytics/', include('analytics.urls')),
+    path('api/layby/', include('layby.urls')),
 ]
 
 # Serve static and media files in development

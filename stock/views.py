@@ -1179,36 +1179,51 @@ class StockTransferListView(APIView):
                     )
                     
                     item_count = len(items)
-                    log_activity(
-                        activity_type=ActivityType.CUSTOM,
-                        user=request.user,
-                        description=f"Created multi-product stock transfer: {item_count} products ({transfer.get_transfer_type_display()})",
-                        request=request,
-                        related_object=transfer,
-                    )
+                
+                # Check for direct completion for admin/owner branch-to-warehouse transfers
+                user_role = getattr(request.user, 'role', '')
+                is_admin_or_owner = user_role in ['admin', 'owner'] or request.user.is_superuser
+                is_branch_to_warehouse = transfer.transfer_type == 'branch_to_warehouse'
+                
+                if is_admin_or_owner and is_branch_to_warehouse:
+                    try:
+                        transfer = services.complete_stock_transfer(
+                            transfer_id=transfer.id,
+                            completed_by=request.user
+                        )
+                        # Append completion to log description
+                        log_desc = f"Created and auto-completed stock transfer: {transfer.quantity if hasattr(transfer, 'quantity') else len(items)} units/items ({transfer.get_transfer_type_display()})"
+                        
+                        log_activity(
+                            activity_type=ActivityType.CUSTOM,
+                            user=request.user,
+                            description=log_desc,
+                            request=request,
+                            related_object=transfer,
+                        )
+                    except Exception as e:
+                        # If completion fails, we still return the created transfer but log the error
+                        # Transfer remains in pending status
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.error(f"Failed to auto-complete transfer {transfer.id}: {str(e)}")
+                        
+                        # Log creation only if completion failed
+                        log_activity(
+                            activity_type=ActivityType.CUSTOM,
+                            user=request.user,
+                            description=f"Created stock transfer (auto-complete failed): {transfer.get_transfer_type_display()}",
+                            request=request,
+                            related_object=transfer,
+                        )
                 else:
-                    # Single product transfer (backward compatible)
-                    transfer = services.create_stock_transfer(
-                        transfer_type=serializer.validated_data['transfer_type'],
-                        product_id=serializer.validated_data['product_id'],
-                        quantity=serializer.validated_data['quantity'],
-                        reorder_level=serializer.validated_data.get('reorder_level'),
-                        source_warehouse_id=serializer.validated_data.get('source_warehouse_id'),
-                        source_branch_id=serializer.validated_data.get('source_branch_id'),
-                        destination_warehouse_id=serializer.validated_data.get('destination_warehouse_id'),
-                        destination_branch_id=destination_branch_id,
-                        supplier_id=serializer.validated_data.get('supplier_id'),
-                        batch_number=serializer.validated_data.get('batch_number') or None,
-                        reference_number=serializer.validated_data.get('reference_number') or None,
-                        notes=serializer.validated_data.get('notes', ''),
-                        selling_price=serializer.validated_data.get('selling_price'),
-                        created_by=request.user
-                    )
+                    item_count = len(items) if items else 1
+                    quantity_desc = f"{item_count} products" if items else f"{transfer.quantity} units of {transfer.product.name}"
                     
                     log_activity(
                         activity_type=ActivityType.CUSTOM,
                         user=request.user,
-                        description=f"Created stock transfer: {transfer.quantity} units of {transfer.product.name} ({transfer.get_transfer_type_display()})",
+                        description=f"Created stock transfer: {quantity_desc} ({transfer.get_transfer_type_display()})",
                         request=request,
                         related_object=transfer,
                     )

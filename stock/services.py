@@ -1061,24 +1061,37 @@ def remove_stock_from_branch(
     branch_id: int,
     quantity: Decimal,
     reason: str = '',
-    created_by=None
+    created_by=None,
+    is_layby: bool = False
 ) -> None:
     """
     Remove stock from branch.
     Uses FIFO (First In First Out) method - removes oldest stock first.
+    If is_layby is True, it also reduces reserved_quantity.
     """
     product = Product.objects.get(pk=product_id)
     branch = Branch.objects.get(pk=branch_id)
     
     with transaction.atomic():
         # Check available stock
-        total_available = BranchStock.objects.filter(
+        stock_agg = BranchStock.objects.filter(
             product=product,
             branch=branch
-        ).aggregate(total=Sum('quantity'))['total'] or Decimal('0')
+        ).aggregate(
+            total=Sum('quantity'),
+            reserved=Sum('reserved_quantity')
+        )
+        total_available = stock_agg['total'] or Decimal('0')
+        total_reserved = stock_agg['reserved'] or Decimal('0')
+        
+        if not is_layby:
+            # For normal sales, ensure we don't dip into reserved stock
+            available_for_sale = total_available - total_reserved
+            if available_for_sale < quantity:
+                raise ValueError(f'Insufficient available stock. Physical: {total_available}, Reserved: {total_reserved}, Available for Sale: {available_for_sale}, Requested: {quantity}')
         
         if total_available < quantity:
-            raise ValueError(f'Insufficient stock. Available: {total_available}, Requested: {quantity}')
+            raise ValueError(f'Insufficient physical stock. Available: {total_available}, Requested: {quantity}')
         
         # Remove stock using FIFO (oldest first)
         remaining_to_remove = quantity
@@ -1092,15 +1105,109 @@ def remove_stock_from_branch(
             if remaining_to_remove <= 0:
                 break
             
-            if entry.quantity > 0:
-                if entry.quantity >= remaining_to_remove:
-                    entry.quantity -= remaining_to_remove
-                    remaining_to_remove = Decimal('0')
-                else:
-                    remaining_to_remove -= entry.quantity
-                    entry.quantity = Decimal('0')
+            remove_amount = min(entry.quantity, remaining_to_remove)
+            entry.quantity -= remove_amount
+            
+            if is_layby:
+                # If it's a layby, we must also reduce the reserved quantity
+                # We assume the reservation was also made FIFO, so we reduce reserved_quantity on this entry
+                if entry.reserved_quantity > 0:
+                    reserved_remove = min(entry.reserved_quantity, remove_amount)
+                    entry.reserved_quantity -= reserved_remove
+                    # If remove_amount > reserved_remove, it means we are selling more than reserved on this batch
+                    # but overall it should balance out if logic is consistent.
+            
+            remaining_to_remove -= remove_amount
+            entry.save()
+
+
+def reserve_stock_at_branch(
+    product_id: int,
+    branch_id: int,
+    quantity: Decimal,
+) -> None:
+    """
+    Reserve stock at a branch for a layby.
+    Increments reserved_quantity using FIFO.
+    """
+    product = Product.objects.get(pk=product_id)
+    branch = Branch.objects.get(pk=branch_id)
+    
+    with transaction.atomic():
+        stock_agg = BranchStock.objects.filter(
+            product=product,
+            branch=branch
+        ).aggregate(
+            total=Sum('quantity'),
+            reserved=Sum('reserved_quantity')
+        )
+        total_quantity = stock_agg['total'] or Decimal('0')
+        total_reserved = stock_agg['reserved'] or Decimal('0')
+        
+        available_to_reserve = total_quantity - total_reserved
+        if available_to_reserve < quantity:
+            raise ValueError(f'Insufficient available stock to reserve. Total: {total_quantity}, Already Reserved: {total_reserved}, Available: {available_to_reserve}, Requested: {quantity}')
+        
+        # Reserve stock using FIFO (reserve oldest physical stock first)
+        remaining_to_reserve = quantity
+        # We look for entries where quantity > reserved_quantity
+        stock_entries = BranchStock.objects.filter(
+            product=product,
+            branch=branch,
+            quantity__gt=F('reserved_quantity')
+        ).order_by('received_date', 'created_at')
+        
+        for entry in stock_entries:
+            if remaining_to_reserve <= 0:
+                break
+            
+            can_reserve = entry.quantity - entry.reserved_quantity
+            reserve_amount = min(can_reserve, remaining_to_reserve)
+            
+            entry.reserved_quantity += reserve_amount
+            remaining_to_reserve -= reserve_amount
+            entry.save()
+
+
+def release_stock_at_branch(
+    product_id: int,
+    branch_id: int,
+    quantity: Decimal,
+) -> None:
+    """
+    Release reserved stock at a branch (e.g. if layby is cancelled).
+    Decrements reserved_quantity using LIFO (release newest reservations first) 
+    or just any reserved entries. FIFO for release is safer to match reservation logic.
+    """
+    product = Product.objects.get(pk=product_id)
+    branch = Branch.objects.get(pk=branch_id)
+    
+    with transaction.atomic():
+        total_reserved = BranchStock.objects.filter(
+            product=product,
+            branch=branch
+        ).aggregate(total=Sum('reserved_quantity'))['total'] or Decimal('0')
+        
+        if total_reserved < quantity:
+            raise ValueError(f'Requested to release more stock than reserved. Reserved: {total_reserved}, Requested: {quantity}')
+            
+        remaining_to_release = quantity
+        # Release starting from entries with reserved stock
+        stock_entries = BranchStock.objects.filter(
+            product=product,
+            branch=branch,
+            reserved_quantity__gt=0
+        ).order_by('-received_date', '-created_at') # Release newest first (LIFO) or stick to FIFO? 
+        # Usually LIFO for release makes sense if we reserved FIFO, but FIFO is fine too.
+        
+        for entry in stock_entries:
+            if remaining_to_release <= 0:
+                break
                 
-                entry.save()
+            release_amount = min(entry.reserved_quantity, remaining_to_release)
+            entry.reserved_quantity -= release_amount
+            remaining_to_release -= release_amount
+            entry.save()
 
 
 def get_branch_stock_summary(branch_id: int, product_id: int = None):
@@ -1761,6 +1868,10 @@ def _complete_single_product_transfer(transfer: StockTransfer, completed_by=None
         if destination_purchase_price == 0 and transfer.purchase_price:
             destination_purchase_price = transfer.purchase_price
         transfer.purchase_price = destination_purchase_price
+
+        destination_selling_price = _calculate_weighted_selling_price(original_entries_used)
+        if destination_selling_price == 0 and transfer.selling_price:
+            destination_selling_price = transfer.selling_price
         
         # Add stock to destination - always generate new unique batch number for transferred stock
         if transfer.destination_warehouse:
@@ -1777,6 +1888,7 @@ def _complete_single_product_transfer(transfer: StockTransfer, completed_by=None
                 warehouse=transfer.destination_warehouse,
                 quantity=transfer.quantity,
                 purchase_price=destination_purchase_price,
+                selling_price=destination_selling_price,
                 reorder_level=destination_reorder_level,
                 supplier_id=supplier_id,
                 batch_number=new_batch_number,
@@ -1829,7 +1941,7 @@ def _complete_single_product_transfer(transfer: StockTransfer, completed_by=None
                     existing_stock.notes += f'\n{transfer_notes}'
                 else:
                     existing_stock.notes = transfer_notes
-                existing_stock.save(update_fields=['quantity', 'purchase_price', 'selling_price', 'reorder_level', 'notes', 'updated_at'])
+                existing_stock.save(update_fields=['quantity', 'purchase_price', 'selling_price', 'reorder_level', 'notes'])
             else:
                 # Create new stock entry
                 new_batch_number = generate_unique_batch_number()
@@ -1960,6 +2072,10 @@ def _complete_multi_product_transfer(transfer: StockTransfer, items, completed_b
             destination_purchase_price = item.purchase_price
         item.purchase_price = destination_purchase_price
         item.save(update_fields=['purchase_price'])
+
+        destination_selling_price = _calculate_weighted_selling_price(original_entries_used)
+        if destination_selling_price == 0 and item.selling_price:
+            destination_selling_price = item.selling_price
         
         # Add stock to destination
         if transfer.destination_warehouse:
@@ -1977,6 +2093,7 @@ def _complete_multi_product_transfer(transfer: StockTransfer, items, completed_b
                 warehouse=transfer.destination_warehouse,
                 quantity=item.quantity,
                 purchase_price=destination_purchase_price,
+                selling_price=destination_selling_price,
                 reorder_level=destination_reorder_level,
                 supplier_id=supplier_id,
                 batch_number=new_batch_number,
@@ -2029,7 +2146,7 @@ def _complete_multi_product_transfer(transfer: StockTransfer, items, completed_b
                     existing_stock.notes += f'\n{transfer_notes}'
                 else:
                     existing_stock.notes = transfer_notes
-                existing_stock.save(update_fields=['quantity', 'purchase_price', 'selling_price', 'reorder_level', 'notes', 'updated_at'])
+                existing_stock.save(update_fields=['quantity', 'purchase_price', 'selling_price', 'reorder_level', 'notes'])
             else:
                 # Create new stock entry
                 new_batch_number = generate_unique_batch_number()
