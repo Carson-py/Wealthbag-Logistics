@@ -903,6 +903,45 @@ class BranchStockListView(APIView):
             status=status.HTTP_403_FORBIDDEN
         )
 
+class BranchStockDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+    
+    @swagger_auto_schema(
+        manual_parameters=[
+            openapi.Parameter('branch_id', openapi.IN_QUERY, type=openapi.TYPE_INTEGER),
+            openapi.Parameter('product_id', openapi.IN_QUERY, type=openapi.TYPE_INTEGER),
+        ],
+        responses={200: BranchStockSerializer(many=True)}
+    )
+    def get(self, request, pk):
+        """Get a specific branch stock entry"""
+        try:
+            branch_stock = BranchStock.objects.get(pk=pk)
+            serializer = BranchStockSerializer(branch_stock)
+            return Response(serializer.data)
+        except BranchStock.DoesNotExist:
+            return Response({'detail': 'Branch stock entry not found.'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @swagger_auto_schema(
+        request_body=BranchStockSerializer,
+        responses={200: BranchStockSerializer}
+    )
+    def put(self, request, pk):
+        """Update a specific branch stock entry"""
+        try:
+            branch_stock = BranchStock.objects.get(pk=pk)
+            serializer = BranchStockSerializer(branch_stock, data=request.data, partial=True)
+
+            if serializer.is_valid():
+                serializer.save()
+                return Response(serializer.data)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        except BranchStock.DoesNotExist:
+            return Response({'detail': 'Branch stock entry not found.'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 class LowStockView(APIView):
     permission_classes = [IsAuthenticated]

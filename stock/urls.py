@@ -21,6 +21,7 @@ urlpatterns = [
     
     # Branch stock endpoints
     path('branch-stock/', views.BranchStockListView.as_view(), name='branch-stock-list'),
+    path('branch-stock/<int:pk>/', views.BranchStockDetailView.as_view(), name='branch-stock-detail'),
     path('branch-stock/remove/', views.RemoveBranchStockView.as_view(), name='branch-stock-remove'),
     path('branch-stock/summary/', views.BranchStockSummaryView.as_view(), name='branch-stock-summary'),
     path('branch-stock/value/', views.BranchStockValueView.as_view(), name='branch-stock-value'),

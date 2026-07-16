@@ -36,13 +36,15 @@ class UserSerializer(serializers.ModelSerializer):
     branch = serializers.SerializerMethodField()
     warehouse = serializers.SerializerMethodField()
     branch_name = serializers.SerializerMethodField()
+    branch_phone = serializers.SerializerMethodField()
+    branch_address = serializers.SerializerMethodField()
     warehouse_name = serializers.SerializerMethodField()
     employee_name = serializers.SerializerMethodField()
     class Meta:
         model = User
         fields = [
             'id', 'email', 'role', 'role_display', 'is_active', 'date_joined', 
-            'first_login', 'branch', 'warehouse', 'branch_name', 'warehouse_name', 'employee_name'
+            'first_login', 'branch', 'warehouse', 'branch_name', 'branch_phone', 'branch_address', 'warehouse_name', 'employee_name'
         ]
         read_only_fields = ['date_joined']
 
@@ -82,6 +84,26 @@ class UserSerializer(serializers.ModelSerializer):
             employee = obj.profile.first()
             if employee and employee.branch:
                 return employee.branch.name
+        except:
+            pass
+        return None
+    
+    def get_branch_phone(self, obj):
+        """Get branch phone from employee profile"""
+        try:
+            employee = obj.profile.first()
+            if employee and employee.branch:
+                return employee.branch.phone
+        except:
+            pass
+        return None
+    
+    def get_branch_address(self, obj):
+        """Get branch address from employee profile"""
+        try:
+            employee = obj.profile.first()
+            if employee and employee.branch:
+                return employee.branch.address
         except:
             pass
         return None

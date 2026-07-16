@@ -91,7 +91,6 @@ class Employee(models.Model):
     warehouse = models.ForeignKey(Warehouse, on_delete=models.SET_NULL, null=True, blank=True)
 
 
-
     def get_full_name(self):
         return f"{self.first_name} {self.last_name}"
 

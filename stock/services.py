@@ -1902,28 +1902,23 @@ def _complete_single_product_transfer(transfer: StockTransfer, completed_by=None
             )
         
         elif transfer.destination_branch:
-            # Add to branch - use selling price from source stock entries
-            selling_price = _calculate_weighted_selling_price(original_entries_used)
-            if selling_price == 0:
-                selling_price = transfer.selling_price
-            
-            # Try to get selling price from source branch stock if available (for branch-to-branch)
-            if selling_price is None and transfer.source_branch:
-                source_stock = BranchStock.objects.filter(
-                    product=transfer.product,
-                    branch=transfer.source_branch,
-                    quantity__gt=0
-                ).first()
-                if source_stock:
-                    selling_price = source_stock.selling_price
+            # Add to branch.
+            # If a selling_price was provided on the transfer, we must respect it.
+            selling_price = transfer.selling_price
             if selling_price is None:
-                selling_price = destination_purchase_price
-            
-            # Always increment existing branch stock for this product, and update prices to latest values
+                selling_price = _calculate_weighted_selling_price(original_entries_used)
+                if selling_price == 0:
+                    # Fallback to a deterministic value to avoid NULL selling_price in BranchStock
+                    selling_price = destination_purchase_price
+
+            # Only increment an existing branch stock row if purchase+selling prices match;
+            # otherwise create a new batch so the branch can keep multiple price layers.
             existing_stock = BranchStock.objects.filter(
                 product=transfer.product,
                 branch=transfer.destination_branch,
-                quantity__gt=0
+                quantity__gt=0,
+                purchase_price=destination_purchase_price,
+                selling_price=selling_price,
             ).order_by('-received_date', '-created_at').first()
             
             transfer_notes = f'Stock replenished via transfer from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
@@ -1937,11 +1932,13 @@ def _complete_single_product_transfer(transfer: StockTransfer, completed_by=None
                 existing_stock.purchase_price = destination_purchase_price
                 existing_stock.selling_price = selling_price
                 existing_stock.reorder_level = destination_reorder_level
+                if supplier_id is not None:
+                    existing_stock.supplier_id = supplier_id
                 if existing_stock.notes:
                     existing_stock.notes += f'\n{transfer_notes}'
                 else:
                     existing_stock.notes = transfer_notes
-                existing_stock.save(update_fields=['quantity', 'purchase_price', 'selling_price', 'reorder_level', 'notes'])
+                existing_stock.save(update_fields=['quantity', 'purchase_price', 'selling_price', 'reorder_level', 'notes', 'supplier'])
             else:
                 # Create new stock entry
                 new_batch_number = generate_unique_batch_number()
@@ -2107,26 +2104,22 @@ def _complete_multi_product_transfer(transfer: StockTransfer, items, completed_b
             )
         
         elif transfer.destination_branch:
-            # Use selling price from source entries (main warehouse) when available
-            selling_price = _calculate_weighted_selling_price(original_entries_used)
-            if selling_price == 0:
-                selling_price = item.selling_price
-            if selling_price is None and transfer.source_branch:
-                source_stock = BranchStock.objects.filter(
-                    product=item.product,
-                    branch=transfer.source_branch,
-                    quantity__gt=0
-                ).first()
-                if source_stock:
-                    selling_price = source_stock.selling_price
+            # Add to branch.
+            # Respect the selling_price provided on the transfer item (if any).
+            selling_price = item.selling_price
             if selling_price is None:
-                selling_price = destination_purchase_price
+                selling_price = _calculate_weighted_selling_price(original_entries_used)
+                if selling_price == 0:
+                    selling_price = destination_purchase_price
             
-            # Always increment existing branch stock for this product and update to new prices
+            # Only increment an existing branch stock row if purchase+selling prices match;
+            # otherwise create a new batch so the branch can keep multiple price layers.
             existing_stock = BranchStock.objects.filter(
                 product=item.product,
                 branch=transfer.destination_branch,
-                quantity__gt=0
+                quantity__gt=0,
+                purchase_price=destination_purchase_price,
+                selling_price=selling_price,
             ).order_by('-received_date', '-created_at').first()
             
             transfer_notes = f'Stock replenished via transfer from {transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name}'
@@ -2142,11 +2135,13 @@ def _complete_multi_product_transfer(transfer: StockTransfer, items, completed_b
                 existing_stock.purchase_price = destination_purchase_price
                 existing_stock.selling_price = selling_price
                 existing_stock.reorder_level = destination_reorder_level
+                if supplier_id is not None:
+                    existing_stock.supplier_id = supplier_id
                 if existing_stock.notes:
                     existing_stock.notes += f'\n{transfer_notes}'
                 else:
                     existing_stock.notes = transfer_notes
-                existing_stock.save(update_fields=['quantity', 'purchase_price', 'selling_price', 'reorder_level', 'notes'])
+                existing_stock.save(update_fields=['quantity', 'purchase_price', 'selling_price', 'reorder_level', 'notes', 'supplier'])
             else:
                 # Create new stock entry
                 new_batch_number = generate_unique_batch_number()

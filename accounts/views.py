@@ -13,6 +13,7 @@ from .serializers import (
 from .permissions import IsAdminOrOwner
 from . import services
 from shared.audit import log_activity, ActivityType
+from .models import Employee
 
 User = get_user_model()
 
@@ -116,6 +117,44 @@ class UserListView(APIView):
         serializer = EmployeeSerializer(users, many=True)
         return Response(serializer.data)
 
+class UserDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            employee = Employee.objects.get(pk=pk)
+        except Employee.DoesNotExist:
+            return Response({'detail': 'Employee not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = EmployeeSerializer(employee)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def put(self, request, pk):
+        try:
+            employee = Employee.objects.get(pk=pk)
+        except Employee.DoesNotExist:
+            return Response({'detail': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = EmployeeSerializer(employee, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        updated_user = serializer.save()
+
+        log_activity(
+            activity_type=ActivityType.USER_UPDATED,
+            user=request.user,
+            description=f"Updated user: {updated_user.first_name} {updated_user.last_name}",
+            request=request,
+            related_object=updated_user,
+            metadata={
+                'target_user_first_name': updated_user.first_name,
+                'updated_fields': list(serializer.validated_data.keys()),
+            }
+        )
+
+        return Response(EmployeeSerializer(updated_user).data, status=status.HTTP_200_OK)
+
 
 class ProfileView(APIView):
     permission_classes = [IsAuthenticated]
@@ -142,7 +181,13 @@ class BlockUnblockAccountView(APIView):
         ),
         responses={200: UserSerializer}
     )
+    def post(self, request):
+        return self._block_unblock_account(request)
+
     def patch(self, request):
+        return self._block_unblock_account(request)
+
+    def _block_unblock_account(self, request):
         user_id = request.data.get('user_id')
 
         if user_id is None:

@@ -242,7 +242,41 @@ def import_products_from_stock_sheet(file_obj, created_by=None, notes: str = '')
     }
 
 
-def create_product(sku: str, name: str, category: int = None, unit: int = None, image=None) -> Product:
+def _get_user_branch(user):
+    """Return the branch assigned to the logged-in user via Employee profile."""
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return None
+    employee = user.profile.first() if hasattr(user, 'profile') else None
+    if employee and employee.branch:
+        return employee.branch
+    return None
+
+
+def _get_selling_price_from_branch_stock(product: Product, branch) -> Optional[Decimal]:
+    """Get the most recent selling price from branch stock for a product at a branch."""
+    if branch is None:
+        return None
+    from stock.models import BranchStock
+    branch_stock = BranchStock.objects.filter(
+        product=product,
+        branch=branch,
+        quantity__gt=0,
+    ).order_by('-received_date', '-created_at').first()
+    if branch_stock and branch_stock.selling_price is not None:
+        return branch_stock.selling_price
+    return None
+
+
+def _format_barcode_price_text(selling_price) -> Optional[str]:
+    if selling_price is None:
+        return None
+    try:
+        return f"USD ${Decimal(selling_price):.2f}"
+    except Exception:
+        return f"USD ${selling_price}"
+
+
+def create_product(sku: str, name: str, category: int = None, unit: int = None, image=None, created_by=None) -> Product:
     """
     Create a new product and automatically generate a barcode linked to the product SKU.
     
@@ -280,12 +314,12 @@ def create_product(sku: str, name: str, category: int = None, unit: int = None, 
     )
     
     # Auto-generate barcode for the product using SKU as barcode value
-    generate_product_barcode(product)
+    generate_product_barcode(product, user=created_by)
     
     return product
 
 
-def generate_product_barcode(product: Product) -> 'Barcode':
+def generate_product_barcode(product: Product, user=None) -> 'Barcode':
     """
     Generate and create a barcode for a product using the product SKU.
     Uses CODE128 format (auto-generated).
@@ -293,6 +327,7 @@ def generate_product_barcode(product: Product) -> 'Barcode':
     
     Args:
         product: Product instance
+        user: Logged-in user; selling price is taken from branch stock at the user's branch
         
     Returns:
         Created Barcode instance
@@ -306,6 +341,8 @@ def generate_product_barcode(product: Product) -> 'Barcode':
     # Check if barcode already exists for this product
     existing_barcode = Barcode.objects.filter(product=product, barcode=barcode_value).first()
     if existing_barcode:
+        if user is not None:
+            regenerate_barcode_image(existing_barcode, user=user)
         return existing_barcode
     
     # Check if barcode value already exists for another product
@@ -313,31 +350,9 @@ def generate_product_barcode(product: Product) -> 'Barcode':
         # If SKU is already used, use product ID instead
         barcode_value = str(product.id)
     
-    # Determine price text (USD) from most recent stock entry
-    from stock.models import StockEntry, BranchStock
-    selling_price = None
-
-    warehouse_stock = StockEntry.objects.filter(
-        product=product,
-        quantity__gt=0
-    ).order_by('-received_date', '-created_at').first()
-    if warehouse_stock and warehouse_stock.selling_price is not None:
-        selling_price = warehouse_stock.selling_price
-
-    if selling_price is None:
-        branch_stock = BranchStock.objects.filter(
-            product=product,
-            quantity__gt=0
-        ).order_by('-received_date', '-created_at').first()
-        if branch_stock and branch_stock.selling_price is not None:
-            selling_price = branch_stock.selling_price
-
-    price_text = None
-    if selling_price is not None:
-        try:
-            price_text = f"USD ${Decimal(selling_price):.2f}"
-        except Exception:
-            price_text = f"USD ${selling_price}"
+    branch = _get_user_branch(user)
+    selling_price = _get_selling_price_from_branch_stock(product, branch)
+    price_text = _format_barcode_price_text(selling_price)
 
     # Generate barcode image (always CODE128) with price label when available
     barcode_image = generate_barcode_image(barcode_value, price_text=price_text)
@@ -364,47 +379,24 @@ def generate_product_barcode(product: Product) -> 'Barcode':
     return barcode
 
 
-def regenerate_barcode_image(barcode: Barcode) -> bool:
+def regenerate_barcode_image(barcode: Barcode, user=None) -> bool:
     """
-    Regenerate barcode image with current selling price from stock entries.
+    Regenerate barcode image with current selling price from the user's branch stock.
     
     Args:
         barcode: Barcode instance to regenerate
+        user: Logged-in user; selling price is taken from branch stock at the user's branch
         
     Returns:
         True if regeneration was successful, False otherwise
     """
     from .utils import generate_barcode_image
-    from stock.models import StockEntry, BranchStock
     from django.core.files.storage import default_storage
     
     try:
-        # Get current selling price from stock entries
-        selling_price = None
-        
-        warehouse_stock = StockEntry.objects.filter(
-            product=barcode.product,
-            quantity__gt=0
-        ).order_by('-received_date', '-created_at').first()
-        
-        if warehouse_stock and warehouse_stock.selling_price is not None:
-            selling_price = warehouse_stock.selling_price
-        
-        if selling_price is None:
-            branch_stock = BranchStock.objects.filter(
-                product=barcode.product,
-                quantity__gt=0
-            ).order_by('-received_date', '-created_at').first()
-            if branch_stock and branch_stock.selling_price is not None:
-                selling_price = branch_stock.selling_price
-        
-        # Format price text
-        price_text = None
-        if selling_price is not None:
-            try:
-                price_text = f"USD ${Decimal(selling_price):.2f}"
-            except Exception:
-                price_text = f"USD ${selling_price}"
+        branch = _get_user_branch(user)
+        selling_price = _get_selling_price_from_branch_stock(barcode.product, branch)
+        price_text = _format_barcode_price_text(selling_price)
         
         # Generate new barcode image with current price
         barcode_image = generate_barcode_image(barcode.barcode, price_text=price_text)
@@ -510,7 +502,8 @@ def bulk_create_products(products_data: List[Dict], created_by=None) -> Tuple[Li
                     name=name,
                     category=category,
                     unit=unit,
-                    image=image
+                    image=image,
+                    created_by=created_by,
                 )
                 
                 # Only add initial stock if quantity is provided

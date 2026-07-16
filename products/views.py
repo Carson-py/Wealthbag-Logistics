@@ -156,7 +156,7 @@ class ProductListView(APIView):
                     )
             
             # Create product with image if provided
-            product = services.create_product(image=image, **data)
+            product = services.create_product(image=image, created_by=request.user, **data)
             # Use purchase_price from product if not provided
             purchase_price = initial_purchase_price
             
@@ -477,7 +477,7 @@ class BarcodeListView(APIView):
 
 class RegenerateBarcodeView(APIView):
     """
-    Regenerate barcode images with current selling prices from stock entries.
+    Regenerate barcode images with current selling prices from the logged-in user's branch stock.
     Supports regenerating a single barcode, all barcodes for a product, or all barcodes.
     """
     permission_classes = [IsAuthenticated]
@@ -571,7 +571,7 @@ class RegenerateBarcodeView(APIView):
                 # Regenerate single barcode
                 try:
                     barcode = Barcode.objects.get(pk=barcode_id)
-                    if services.regenerate_barcode_image(barcode):
+                    if services.regenerate_barcode_image(barcode, user=request.user):
                         regenerated_count += 1
                         regenerated_barcodes.append(barcode.id)
                         
@@ -597,7 +597,7 @@ class RegenerateBarcodeView(APIView):
                         )
                     
                     for barcode in barcodes:
-                        if services.regenerate_barcode_image(barcode):
+                        if services.regenerate_barcode_image(barcode, user=request.user):
                             regenerated_count += 1
                             regenerated_barcodes.append(barcode.id)
                         else:
@@ -622,7 +622,7 @@ class RegenerateBarcodeView(APIView):
                     )
                 
                 for barcode in barcodes:
-                    if services.regenerate_barcode_image(barcode):
+                    if services.regenerate_barcode_image(barcode, user=request.user):
                         regenerated_count += 1
                         regenerated_barcodes.append(barcode.id)
                     else:

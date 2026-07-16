@@ -41,6 +41,7 @@ class Branch(models.Model):
                                   verbose_name='Warehouse', 
                                   help_text='Warehouse this branch belongs to (optional)')
     address = models.TextField(blank=True)
+    phone = models.CharField(max_length=20, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
