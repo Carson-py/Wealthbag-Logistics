@@ -80,6 +80,8 @@ class StockEntryItemSerializer(serializers.Serializer):
     product_id = serializers.IntegerField(required=True)
     quantity = serializers.DecimalField(max_digits=12, decimal_places=2, required=True)
     purchase_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=True)
+    selling_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True,
+                                             help_text='Selling price (optional; defaults to purchase_price if not provided)')
     reorder_level = serializers.IntegerField(required=False, allow_null=True, help_text='Reorder level (optional)')
     supplier_id = serializers.IntegerField(required=False, allow_null=True, help_text='Supplier ID (optional)')
     batch_number = serializers.CharField(required=False, allow_blank=True, help_text='Batch number (auto-generated if not provided)')
@@ -93,6 +95,8 @@ class AddStockSerializer(serializers.Serializer):
     quantity = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True, help_text='Quantity (required if items not provided)')
     reorder_level = serializers.IntegerField(required=False, allow_null=True, help_text='Reorder level (optional)')
     purchase_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True, help_text='Purchase price (required if items not provided)')
+    selling_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True,
+                                             help_text='Selling price (optional; defaults to purchase_price if not provided)')
     supplier_id = serializers.IntegerField(required=False, allow_null=True, help_text='Supplier ID (optional, for single product)')
     batch_number = serializers.CharField(required=False, allow_blank=True,
                                         help_text='Batch number (auto-generated if not provided, for single product)')
@@ -545,5 +549,150 @@ class ImportStockTransfersFromExcelSerializer(serializers.Serializer):
             if not data.get('destination_warehouse_id'):
                 raise serializers.ValidationError('destination_warehouse_id (or name) is required for branch_to_warehouse transfers')
         
+        return data
+
+
+# ========== Admin Warehouse & Branch Stock Transfer Serializers ==========
+
+class AdminTransferStockItemSerializer(serializers.Serializer):
+    """
+    Represents a single stock entry line (from a warehouse or branch) to be moved to a branch.
+    The admin selects a specific StockEntry or BranchStock by ID and specifies how many units to move.
+    """
+    stock_entry_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text='ID of the source warehouse StockEntry or BranchStock to draw stock from'
+    )
+    branch_stock_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text='ID of the source BranchStock (alternative to stock_entry_id when source is a branch)'
+    )
+    quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=True,
+        help_text='Quantity to move to the destination branch'
+    )
+    selling_price = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True,
+        help_text='Selling price at destination branch (optional; uses source entry selling price if omitted)'
+    )
+    reorder_level = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text='Reorder level at destination branch (optional; uses source entry level if omitted)'
+    )
+    notes = serializers.CharField(required=False, allow_blank=True, help_text='Line-item notes (optional)')
+
+
+class AdminWarehouseToBranchSerializer(serializers.Serializer):
+    """
+    Admin-only: Move selected stock entries (from warehouse or branch) to a branch immediately.
+    No approval required.
+
+    The admin selects specific stock entries (by ID) from the source (warehouse or branch)
+    and specifies how many units of each to transfer to the destination branch.
+    The transfer is created and completed in a single atomic operation.
+    """
+    source_warehouse_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text='ID of the source warehouse (required if source_branch_id is not provided)'
+    )
+    source_branch_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text='ID of the source branch (required if source_warehouse_id is not provided)'
+    )
+    destination_branch_id = serializers.IntegerField(
+        required=True,
+        help_text='ID of the destination branch'
+    )
+    items = AdminTransferStockItemSerializer(
+        many=True, required=True,
+        help_text='List of stock entries to move; each entry specifies stock_entry_id/branch_stock_id and quantity'
+    )
+    reference_number = serializers.CharField(
+        required=False, allow_blank=True,
+        help_text='Transfer reference number (auto-generated if omitted)'
+    )
+    notes = serializers.CharField(
+        required=False, allow_blank=True,
+        help_text='Transfer-level notes (optional)'
+    )
+
+    def validate(self, data):
+        source_warehouse_id = data.get('source_warehouse_id')
+        source_branch_id = data.get('source_branch_id')
+        destination_branch_id = data.get('destination_branch_id')
+
+        if not source_warehouse_id and not source_branch_id:
+            raise serializers.ValidationError('Either source_warehouse_id or source_branch_id must be provided.')
+        if source_warehouse_id and source_branch_id:
+            raise serializers.ValidationError('Cannot provide both source_warehouse_id and source_branch_id.')
+        if source_branch_id and source_branch_id == destination_branch_id:
+            raise serializers.ValidationError('Source and destination branches cannot be the same.')
+
+        items = data.get('items', [])
+        if not items:
+            raise serializers.ValidationError('At least one item must be provided.')
+
+        for item in items:
+            if not item.get('stock_entry_id') and not item.get('branch_stock_id'):
+                raise serializers.ValidationError('Each item must include stock_entry_id or branch_stock_id.')
+
+        return data
+
+
+class AdminWarehouseToBranchExcelSerializer(serializers.Serializer):
+    """
+    Admin-only: Upload an Excel file to move stock from a warehouse or branch to a branch immediately.
+    No approval required.
+
+    Required Excel columns (case-insensitive):
+        - product_name  : Name of the product (required)
+        - quantity      : Quantity to transfer (required)
+
+    Optional Excel columns:
+        - description   : Product description (recommended when product names are ambiguous)
+        - selling_price : Override selling price at destination (uses source entry price if omitted)
+        - reorder_level : Reorder level at destination branch
+        - item_notes    : Per-row notes
+
+    The service resolves each product row to the oldest available stock entry
+    (FIFO order) in the source warehouse or branch.
+    """
+    file = serializers.FileField(
+        required=True,
+        help_text='Excel file (.xlsx) listing products and quantities to transfer'
+    )
+    source_warehouse_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text='ID of the source warehouse (required if source_branch_id is not provided)'
+    )
+    source_branch_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text='ID of the source branch (required if source_warehouse_id is not provided)'
+    )
+    destination_branch_id = serializers.IntegerField(
+        required=True,
+        help_text='ID of the destination branch'
+    )
+    reference_number = serializers.CharField(
+        required=False, allow_blank=True,
+        help_text='Transfer reference number (auto-generated if omitted)'
+    )
+    notes = serializers.CharField(
+        required=False, allow_blank=True,
+        help_text='Transfer-level notes (optional)'
+    )
+
+    def validate(self, data):
+        source_warehouse_id = data.get('source_warehouse_id')
+        source_branch_id = data.get('source_branch_id')
+        destination_branch_id = data.get('destination_branch_id')
+
+        if not source_warehouse_id and not source_branch_id:
+            raise serializers.ValidationError('Either source_warehouse_id or source_branch_id must be provided.')
+        if source_warehouse_id and source_branch_id:
+            raise serializers.ValidationError('Cannot provide both source_warehouse_id and source_branch_id.')
+        if source_branch_id and source_branch_id == destination_branch_id:
+            raise serializers.ValidationError('Source and destination branches cannot be the same.')
+
         return data
 

@@ -910,6 +910,7 @@ def bulk_add_stock_to_warehouse(stock_entries_data: List[Dict], created_by=None)
                     quantity=entry_data.get('quantity'),
                     reorder_level=entry_data.get('reorder_level'),
                     purchase_price=entry_data.get('purchase_price'),
+                    selling_price=entry_data.get('selling_price'),  # None falls back to purchase_price in add_stock_to_warehouse
                     supplier_id=entry_data.get('supplier_id'),
                     batch_number=entry_data.get('batch_number'),
                     notes=entry_data.get('notes', ''),
@@ -2837,6 +2838,498 @@ def send_transfer_invoice_email(transfer: StockTransfer) -> None:
         import logging
         logger = logging.getLogger(__name__)
         logger.error(f'Error sending transfer invoice email: {str(e)}')
+
+
+# ========== Admin Stock Transfer Functions (Warehouse & Branch to Branch) ==========
+
+def admin_move_warehouse_to_branch(
+    source_warehouse_id: int = None,
+    destination_branch_id: int = None,
+    items_data: List[Dict] = None,
+    reference_number: str = None,
+    notes: str = '',
+    created_by=None,
+    source_branch_id: int = None,
+) -> StockTransfer:
+    """
+    Admin-only: Immediately move selected stock entries (from warehouse or branch) to a branch.
+    No approval required — creates the transfer and completes it atomically.
+
+    Args:
+        source_warehouse_id: Warehouse to move stock from (optional if source_branch_id is provided).
+        destination_branch_id: Branch to move stock to.
+        items_data: List of dicts, each with:
+            - stock_entry_id or branch_stock_id: int — the source stock entry to draw from
+            - quantity: Decimal — how much to move
+            - selling_price: Decimal (optional, taken from source entry if omitted)
+            - reorder_level: int (optional)
+            - notes: str (optional)
+        reference_number: Optional reference (auto-generated if blank).
+        notes: Transfer-level notes.
+        created_by: The admin user performing the action.
+        source_branch_id: Branch to move stock from (optional if source_warehouse_id is provided).
+
+    Returns:
+        Completed StockTransfer instance.
+    """
+    if not source_warehouse_id and not source_branch_id:
+        raise ValueError('Either source_warehouse_id or source_branch_id must be provided.')
+    if source_warehouse_id and source_branch_id:
+        raise ValueError('Cannot provide both source_warehouse_id and source_branch_id.')
+
+    source_warehouse = Warehouse.objects.get(pk=source_warehouse_id) if source_warehouse_id else None
+    source_branch = Branch.objects.get(pk=source_branch_id) if source_branch_id else None
+    destination_branch = Branch.objects.get(pk=destination_branch_id)
+
+    transfer_type = 'warehouse_to_branch' if source_warehouse else 'branch_to_branch'
+
+    with transaction.atomic():
+        # Build transfer record
+        transfer = StockTransfer(
+            transfer_type=transfer_type,
+            source_warehouse=source_warehouse,
+            source_branch=source_branch,
+            destination_branch=destination_branch,
+            reference_number=reference_number or '',
+            notes=notes,
+            status='pending',
+            created_by=created_by,
+        )
+        transfer.full_clean()
+        transfer.save()
+
+        for item_data in items_data:
+            stock_entry_id = item_data.get('stock_entry_id') or item_data.get('branch_stock_id')
+            quantity = Decimal(str(item_data['quantity']))
+            item_selling_price = item_data.get('selling_price')
+            item_reorder_level = item_data.get('reorder_level')
+            item_notes = item_data.get('notes', '')
+
+            if source_warehouse:
+                # Fetch and validate source warehouse stock entry
+                try:
+                    stock_entry = StockEntry.objects.get(pk=stock_entry_id, warehouse=source_warehouse)
+                except StockEntry.DoesNotExist:
+                    raise ValueError(
+                        f'Stock entry {stock_entry_id} not found in warehouse {source_warehouse.name}.'
+                    )
+
+                if stock_entry.quantity < quantity:
+                    raise ValueError(
+                        f'Insufficient stock for {stock_entry.product.name} '
+                        f'(batch {stock_entry.batch_number}). '
+                        f'Available: {stock_entry.quantity}, Requested: {quantity}'
+                    )
+
+                if item_selling_price is None:
+                    item_selling_price = stock_entry.selling_price
+
+                reorder_level = item_reorder_level if item_reorder_level is not None else stock_entry.reorder_level
+
+                # Record the transfer item
+                StockTransferItem.objects.create(
+                    transfer=transfer,
+                    product=stock_entry.product,
+                    quantity=quantity,
+                    purchase_price=stock_entry.purchase_price,
+                    selling_price=item_selling_price,
+                    reorder_level=reorder_level,
+                    supplier_id=stock_entry.supplier_id,
+                    batch_number=stock_entry.batch_number,
+                    notes=item_notes,
+                )
+
+                # Deduct from warehouse entry
+                stock_entry.quantity -= quantity
+                stock_entry.save()
+
+                # Add to branch stock
+                existing_branch_stock = BranchStock.objects.filter(
+                    product=stock_entry.product,
+                    branch=destination_branch,
+                    quantity__gt=0,
+                    purchase_price=stock_entry.purchase_price,
+                    selling_price=item_selling_price,
+                ).order_by('-received_date', '-created_at').first()
+
+                transfer_notes = (
+                    f'Stock moved from {source_warehouse.name} '
+                    f'(batch: {stock_entry.batch_number}) by admin'
+                )
+                if item_notes:
+                    transfer_notes += f': {item_notes}'
+                if notes:
+                    transfer_notes += f' | Transfer: {notes}'
+
+                if existing_branch_stock:
+                    existing_branch_stock.quantity += quantity
+                    existing_branch_stock.reorder_level = reorder_level
+                    if existing_branch_stock.notes:
+                        existing_branch_stock.notes += f'\n{transfer_notes}'
+                    else:
+                        existing_branch_stock.notes = transfer_notes
+                    existing_branch_stock.save(update_fields=['quantity', 'reorder_level', 'notes'])
+                else:
+                    new_batch_number = generate_unique_batch_number()
+                    BranchStock.objects.create(
+                        product=stock_entry.product,
+                        branch=destination_branch,
+                        quantity=quantity,
+                        purchase_price=stock_entry.purchase_price,
+                        selling_price=item_selling_price,
+                        reorder_level=reorder_level,
+                        supplier_id=stock_entry.supplier_id,
+                        batch_number=new_batch_number,
+                        original_batch_number=stock_entry.batch_number,
+                        notes=transfer_notes,
+                        created_by=created_by,
+                        received_date=timezone.now(),
+                        is_initial_stock=False,
+                        source_transfer=transfer,
+                        original_stock_entry=stock_entry,
+                    )
+
+            elif source_branch:
+                # Fetch and validate source branch stock entry
+                try:
+                    branch_stock = BranchStock.objects.get(pk=stock_entry_id, branch=source_branch)
+                except BranchStock.DoesNotExist:
+                    raise ValueError(
+                        f'Branch stock entry {stock_entry_id} not found in branch {source_branch.name}.'
+                    )
+
+                if branch_stock.quantity < quantity:
+                    raise ValueError(
+                        f'Insufficient stock for {branch_stock.product.name} '
+                        f'(batch {branch_stock.batch_number}). '
+                        f'Available: {branch_stock.quantity}, Requested: {quantity}'
+                    )
+
+                if item_selling_price is None:
+                    item_selling_price = branch_stock.selling_price
+
+                reorder_level = item_reorder_level if item_reorder_level is not None else branch_stock.reorder_level
+
+                # Record the transfer item
+                StockTransferItem.objects.create(
+                    transfer=transfer,
+                    product=branch_stock.product,
+                    quantity=quantity,
+                    purchase_price=branch_stock.purchase_price,
+                    selling_price=item_selling_price,
+                    reorder_level=reorder_level,
+                    supplier_id=branch_stock.supplier_id,
+                    batch_number=branch_stock.batch_number,
+                    notes=item_notes,
+                )
+
+                # Deduct from source branch stock
+                branch_stock.quantity -= quantity
+                branch_stock.save()
+
+                # Add to destination branch stock
+                existing_branch_stock = BranchStock.objects.filter(
+                    product=branch_stock.product,
+                    branch=destination_branch,
+                    quantity__gt=0,
+                    purchase_price=branch_stock.purchase_price,
+                    selling_price=item_selling_price,
+                ).order_by('-received_date', '-created_at').first()
+
+                transfer_notes = (
+                    f'Stock moved from branch {source_branch.name} '
+                    f'(batch: {branch_stock.batch_number}) by admin'
+                )
+                if item_notes:
+                    transfer_notes += f': {item_notes}'
+                if notes:
+                    transfer_notes += f' | Transfer: {notes}'
+
+                if existing_branch_stock:
+                    existing_branch_stock.quantity += quantity
+                    existing_branch_stock.reorder_level = reorder_level
+                    if existing_branch_stock.notes:
+                        existing_branch_stock.notes += f'\n{transfer_notes}'
+                    else:
+                        existing_branch_stock.notes = transfer_notes
+                    existing_branch_stock.save(update_fields=['quantity', 'reorder_level', 'notes'])
+                else:
+                    new_batch_number = generate_unique_batch_number()
+                    BranchStock.objects.create(
+                        product=branch_stock.product,
+                        branch=destination_branch,
+                        quantity=quantity,
+                        purchase_price=branch_stock.purchase_price,
+                        selling_price=item_selling_price,
+                        reorder_level=reorder_level,
+                        supplier_id=branch_stock.supplier_id,
+                        batch_number=new_batch_number,
+                        original_batch_number=branch_stock.original_batch_number or branch_stock.batch_number,
+                        notes=transfer_notes,
+                        created_by=created_by,
+                        received_date=timezone.now(),
+                        is_initial_stock=False,
+                        source_transfer=transfer,
+                        original_branch_stock=branch_stock,
+                    )
+
+        # Mark transfer as completed immediately — no approval needed for admin
+        transfer.status = 'completed'
+        transfer.completed_by = created_by
+        transfer.completed_at = timezone.now()
+        transfer.save()
+
+    # Send notifications (non-blocking)
+    try:
+        if transfer.destination_branch:
+            _send_transfer_completion_notification_email(transfer)
+        send_transfer_invoice_email(transfer)
+    except Exception:
+        pass
+
+    return transfer
+
+
+def admin_import_warehouse_to_branch_from_excel(
+    file_obj,
+    source_warehouse_id: int = None,
+    destination_branch_id: int = None,
+    reference_number: str = None,
+    notes: str = '',
+    created_by=None,
+    source_branch_id: int = None,
+) -> Dict[str, Any]:
+    """
+    Admin-only: Import a transfer (from warehouse or branch to a branch) from an Excel file and
+    complete it immediately (no approval step).
+
+    Expected Excel columns (case-insensitive):
+        - product_name  (required)
+        - description   (optional, recommended when multiple products share a name)
+        - quantity      (required)
+        - selling_price (optional, auto-filled from source entry)
+        - reorder_level (optional)
+        - item_notes    (optional)
+
+    Returns a result dict with 'created', 'errors', and 'summary' keys.
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise ValueError('openpyxl is required to import Excel files.') from exc
+
+    if not source_warehouse_id and not source_branch_id:
+        raise ValueError('Either source_warehouse_id or source_branch_id must be provided.')
+    if source_warehouse_id and source_branch_id:
+        raise ValueError('Cannot provide both source_warehouse_id and source_branch_id.')
+
+    source_warehouse = Warehouse.objects.get(pk=source_warehouse_id) if source_warehouse_id else None
+    source_branch = Branch.objects.get(pk=source_branch_id) if source_branch_id else None
+
+    wb = load_workbook(file_obj, data_only=True)
+    ws = wb.active
+
+    headers = []
+    for cell in ws[1]:
+        headers.append(str(cell.value).strip().lower() if cell.value is not None else '')
+
+    # Map column headers to internal keys
+    header_to_key = {}
+    for idx, header in enumerate(headers):
+        h = header.lower().strip()
+        if h in ('product_name', 'product name', 'product'):
+            header_to_key[idx] = 'product_name'
+        elif h in ('description', 'desc'):
+            header_to_key[idx] = 'description'
+        elif h in ('quantity', 'qty'):
+            header_to_key[idx] = 'quantity'
+        elif h in ('selling_price', 'selling price', 'price'):
+            header_to_key[idx] = 'selling_price'
+        elif h in ('reorder_level', 'reorder level'):
+            header_to_key[idx] = 'reorder_level'
+        elif h in ('item_notes', 'item notes', 'notes'):
+            header_to_key[idx] = 'item_notes'
+
+    row_errors = []
+    items_data = []
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        row_data = {header_to_key[i]: row[i].value for i in header_to_key if i < len(row)}
+
+        # Skip completely blank rows
+        if all(val in (None, '') for val in row_data.values()):
+            continue
+
+        try:
+            product_name = (row_data.get('product_name') or '').strip()
+            description = (row_data.get('description') or '').strip()
+
+            if not product_name:
+                raise ValueError('product_name is required')
+
+            # Resolve product
+            product = None
+            if product_name and description:
+                product = Product.objects.filter(
+                    name__iexact=product_name,
+                    description__iexact=description,
+                ).first()
+                if not product:
+                    by_name = Product.objects.filter(name__iexact=product_name)
+                    if by_name.count() > 1:
+                        raise ValueError(
+                            f'Multiple products with name "{product_name}". '
+                            f'Provide description to disambiguate.'
+                        )
+                    product = by_name.first()
+            elif product_name:
+                by_name = Product.objects.filter(name__iexact=product_name)
+                if by_name.count() > 1:
+                    raise ValueError(
+                        f'Multiple products with name "{product_name}". '
+                        f'Provide description to disambiguate.'
+                    )
+                product = by_name.first()
+
+            if not product:
+                raise ValueError(
+                    f'Product not found: {product_name}'
+                    + (f' (description: {description})' if description else '')
+                )
+
+            quantity = _safe_decimal(row_data.get('quantity'))
+            if quantity is None or quantity <= 0:
+                raise ValueError('Valid quantity is required')
+
+            # Find stock entry in source warehouse or branch (FIFO)
+            if source_warehouse:
+                stock_entry = StockEntry.objects.filter(
+                    product=product,
+                    warehouse=source_warehouse,
+                    quantity__gte=quantity,
+                ).order_by('received_date', 'created_at').first()
+
+                if not stock_entry:
+                    total_available = StockEntry.objects.filter(
+                        product=product,
+                        warehouse=source_warehouse,
+                        quantity__gt=0,
+                    ).aggregate(total=Sum('quantity'))['total'] or Decimal('0')
+                    if total_available < quantity:
+                        raise ValueError(
+                            f'Insufficient warehouse stock for {product.name}. '
+                            f'Available: {total_available}, Requested: {quantity}'
+                        )
+                    stock_entry = StockEntry.objects.filter(
+                        product=product,
+                        warehouse=source_warehouse,
+                        quantity__gt=0,
+                    ).order_by('received_date', 'created_at').first()
+                target_stock_id = stock_entry.id
+            elif source_branch:
+                branch_stock = BranchStock.objects.filter(
+                    product=product,
+                    branch=source_branch,
+                    quantity__gte=quantity,
+                ).order_by('received_date', 'created_at').first()
+
+                if not branch_stock:
+                    total_available = BranchStock.objects.filter(
+                        product=product,
+                        branch=source_branch,
+                        quantity__gt=0,
+                    ).aggregate(total=Sum('quantity'))['total'] or Decimal('0')
+                    if total_available < quantity:
+                        raise ValueError(
+                            f'Insufficient branch stock for {product.name}. '
+                            f'Available: {total_available}, Requested: {quantity}'
+                        )
+                    branch_stock = BranchStock.objects.filter(
+                        product=product,
+                        branch=source_branch,
+                        quantity__gt=0,
+                    ).order_by('received_date', 'created_at').first()
+                target_stock_id = branch_stock.id
+
+            item_selling_price = _safe_decimal(row_data.get('selling_price'))
+            item_reorder_level = _safe_decimal(row_data.get('reorder_level'))
+            item_notes = (row_data.get('item_notes') or '').strip()
+
+            item = {
+                'stock_entry_id': target_stock_id,
+                'quantity': quantity,
+            }
+            if item_selling_price is not None:
+                item['selling_price'] = item_selling_price
+            if item_reorder_level is not None:
+                item['reorder_level'] = int(item_reorder_level)
+            if item_notes:
+                item['notes'] = item_notes
+
+            items_data.append(item)
+
+        except Exception as exc:
+            row_errors.append({'row': row_idx, 'error': str(exc)})
+
+    if not items_data:
+        return {
+            'created': [],
+            'errors': row_errors,
+            'summary': {
+                'total_rows': ws.max_row - 1,
+                'processed': len(row_errors),
+                'successful': 0,
+                'failed': len(row_errors),
+            },
+        }
+
+    try:
+        transfer = admin_move_warehouse_to_branch(
+            source_warehouse_id=source_warehouse_id,
+            source_branch_id=source_branch_id,
+            destination_branch_id=destination_branch_id,
+            items_data=items_data,
+            reference_number=reference_number or None,
+            notes=notes or 'Admin import from Excel',
+            created_by=created_by,
+        )
+
+        created_items = []
+        for item in transfer.items.all():
+            created_items.append({
+                'product': item.product.name,
+                'product_sku': item.product.sku,
+                'quantity': str(item.quantity),
+            })
+
+        return {
+            'created': [{
+                'transfer_id': transfer.id,
+                'reference_number': transfer.reference_number,
+                'status': transfer.status,
+                'items': created_items,
+                'total_items': len(created_items),
+            }],
+            'errors': row_errors,
+            'summary': {
+                'total_rows': ws.max_row - 1,
+                'processed': len(items_data) + len(row_errors),
+                'successful': len(items_data),
+                'failed': len(row_errors),
+            },
+        }
+    except Exception as exc:
+        return {
+            'created': [],
+            'errors': row_errors + [{'row': 'all', 'error': f'Transfer failed: {str(exc)}'}],
+            'summary': {
+                'total_rows': ws.max_row - 1,
+                'processed': len(items_data) + len(row_errors),
+                'successful': 0,
+                'failed': len(items_data) + len(row_errors),
+            },
+        }
+
 
 
 def import_stock_transfers_from_excel(

@@ -57,7 +57,7 @@ def _safe_decimal(value) -> Optional[Decimal]:
 def import_products_from_stock_sheet(file_obj, created_by=None, notes: str = '') -> Dict[str, Any]:
     """
     Import products (and suppliers) from an Excel (.xlsx) file using stock sheet columns:
-        product name, description, selling prices, cost per unit, total quantity, supplier name, supplier email address
+        sku, product name, description, selling prices, cost per unit, total quantity, supplier name, supplier email address
     
     Product matching and creation rules:
         - Products can have the same name and/or description (multiple products allowed)
@@ -80,6 +80,7 @@ def import_products_from_stock_sheet(file_obj, created_by=None, notes: str = '')
 
     # Allow flexible header aliases (case-insensitive)
     header_aliases = {
+        'sku': ['sku', 'product sku', 'item sku', 'barcode'],
         'product_name': ['product name', 'name', 'product'],
         'description': ['description', 'desc'],
         'selling_price': ['selling prices', 'selling price', 'sell price', 'selling', 'price (selling)'],
@@ -98,7 +99,7 @@ def import_products_from_stock_sheet(file_obj, created_by=None, notes: str = '')
                 header_to_key[idx] = key
                 break
 
-    required_keys = set(header_aliases.keys())
+    required_keys = set(k for k in header_aliases.keys() if k != 'sku') # SKU is optional
     found_keys = set(header_to_key.values())
     missing_keys = required_keys - found_keys
     if missing_keys:
@@ -116,6 +117,7 @@ def import_products_from_stock_sheet(file_obj, created_by=None, notes: str = '')
             continue
 
         try:
+            sku = (row_data.get('sku') or '').strip()
             product_name = (row_data.get('product_name') or '').strip()
             description = (row_data.get('description') or '').strip()
             supplier_name = (row_data.get('supplier_name') or '').strip()
@@ -137,11 +139,15 @@ def import_products_from_stock_sheet(file_obj, created_by=None, notes: str = '')
                 supplier = Supplier.objects.create(name=supplier_name, email=supplier_email)
 
             # Product lookup or create with rules:
+            # - Match by SKU first if provided
             # - Match by BOTH name AND description (case-insensitive)
             # - If both name and description match an existing product, reuse it (will increment stock)
             # - Otherwise, create a new product (allows products with same name/description to exist separately)
             product = None
-            if product_name and description:
+            if sku:
+                product = Product.objects.filter(sku__iexact=sku).first()
+
+            if not product and product_name and description:
                 # Match by both name and description
                 product = Product.objects.filter(
                     name__iexact=product_name,
@@ -164,7 +170,8 @@ def import_products_from_stock_sheet(file_obj, created_by=None, notes: str = '')
             
             # If no matching product found, create a new one
             if not product:
-                sku = _generate_unique_sku_from_name(product_name or description or 'SKU')
+                if not sku:
+                    sku = _generate_unique_sku_from_name(product_name or description or 'SKU')
                 product = Product.objects.create(
                     sku=sku,
                     name=product_name or description or sku,
@@ -421,7 +428,7 @@ def regenerate_barcode_image(barcode: Barcode, user=None) -> bool:
 
 
 def add_product_to_main_warehouse(product: Product, warehouse_id: int, quantity: Decimal, 
-                                  purchase_price: Decimal = None, supplier_id: int = None,
+                                  purchase_price: Decimal = None,selling_price: Decimal = None, supplier_id: int = None,
                                   batch_number: str = None, created_by=None):
     """
     Add product to main warehouse (initial stock).
@@ -433,6 +440,7 @@ def add_product_to_main_warehouse(product: Product, warehouse_id: int, quantity:
         warehouse_id=warehouse_id,
         quantity=quantity,
         purchase_price=purchase_price,
+        selling_price=selling_price,
         supplier_id=supplier_id,
         batch_number=batch_number,
         notes=f'Initial stock for product {product.name}',
@@ -493,6 +501,7 @@ def bulk_create_products(products_data: List[Dict], created_by=None) -> Tuple[Li
                 initial_warehouse_id = product_data.get('initial_warehouse_id')
                 initial_quantity = product_data.get('initial_quantity')
                 initial_purchase_price = product_data.get('initial_purchase_price')
+                initial_selling_price = product_data.get('initial_selling_price')
                 supplier_id = product_data.get('supplier_id')
                 batch_number = product_data.get('batch_number')
                 
@@ -519,6 +528,7 @@ def bulk_create_products(products_data: List[Dict], created_by=None) -> Tuple[Li
                         warehouse_id=initial_warehouse_id,
                         quantity=initial_quantity,
                         purchase_price=initial_purchase_price,
+                        selling_price=initial_selling_price,
                         supplier_id=supplier_id,
                         batch_number=batch_number,
                         created_by=created_by

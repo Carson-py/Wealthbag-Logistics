@@ -15,7 +15,8 @@ from .serializers import (
     BranchStockSerializer, AddBranchStockSerializer, RemoveBranchStockSerializer,
     StockTransferSerializer, CreateStockTransferSerializer, BulkCreateStockTransferSerializer,
     LowStockSerializer, BranchLowStockSerializer, ImportStockFromExcelSerializer,
-    ImportProductsFromExcelSerializer, ImportStockTransfersFromExcelSerializer
+    ImportProductsFromExcelSerializer, ImportStockTransfersFromExcelSerializer,
+    AdminWarehouseToBranchSerializer, AdminWarehouseToBranchExcelSerializer
 )
 from .models import Supplier, StockEntry, StockAdjustment, BranchStock, StockTransfer
 from organization.models import Warehouse
@@ -1455,3 +1456,162 @@ class CancelStockTransferView(APIView):
             return Response({'detail': 'Transfer not found.'}, status=status.HTTP_404_NOT_FOUND)
         except ValueError as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ========== Admin Stock Transfer Views (Warehouse & Branch to Branch) ==========
+
+class AdminWarehouseToBranchTransferView(APIView):
+    """
+    Admin-only endpoint to move stock from a warehouse or branch to another branch.
+    The admin selects specific source stock entry records and quantities;
+    the transfer is created and completed immediately without any approval step.
+    """
+    permission_classes = [IsAuthenticated, IsAdminOrOwner]
+
+    @swagger_auto_schema(
+        request_body=AdminWarehouseToBranchSerializer,
+        responses={
+            201: openapi.Response(
+                description='Stock moved successfully. Returns the completed StockTransfer.',
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'transfer': openapi.Schema(type=openapi.TYPE_OBJECT),
+                        'detail': openapi.Schema(type=openapi.TYPE_STRING),
+                    }
+                )
+            ),
+            400: openapi.Response(description='Validation or stock error'),
+            403: openapi.Response(description='Admin/Owner access required'),
+        }
+    )
+    def post(self, request):
+        """
+        Move selected warehouse or branch stock entries to a branch (admin only, immediate, no approval).
+
+        Provide either `source_warehouse_id` or `source_branch_id`, `destination_branch_id`, and a list of `items`.
+        Each item must include `stock_entry_id` or `branch_stock_id` (the source stock entry to draw from)
+        and `quantity` (how many units to move). Optionally override `selling_price`,
+        `reorder_level`, or add `notes` per item.
+        """
+        serializer = AdminWarehouseToBranchSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                transfer = services.admin_move_warehouse_to_branch(
+                    source_warehouse_id=serializer.validated_data.get('source_warehouse_id'),
+                    source_branch_id=serializer.validated_data.get('source_branch_id'),
+                    destination_branch_id=serializer.validated_data['destination_branch_id'],
+                    items_data=[
+                        {
+                            'stock_entry_id': item.get('stock_entry_id') or item.get('branch_stock_id'),
+                            'branch_stock_id': item.get('branch_stock_id') or item.get('stock_entry_id'),
+                            'quantity': item['quantity'],
+                            **({'selling_price': item['selling_price']} if item.get('selling_price') is not None else {}),
+                            **({'reorder_level': item['reorder_level']} if item.get('reorder_level') is not None else {}),
+                            **({'notes': item['notes']} if item.get('notes') else {}),
+                        }
+                        for item in serializer.validated_data['items']
+                    ],
+                    reference_number=serializer.validated_data.get('reference_number') or None,
+                    notes=serializer.validated_data.get('notes', ''),
+                    created_by=request.user,
+                )
+
+                source_name = transfer.source_warehouse.name if transfer.source_warehouse else transfer.source_branch.name
+
+                log_activity(
+                    activity_type=ActivityType.CUSTOM,
+                    user=request.user,
+                    description=(
+                        f"Admin moved {transfer.items.count()} stock item(s) from "
+                        f"{source_name} to {transfer.destination_branch.name} "
+                        f"(Ref: {transfer.reference_number})"
+                    ),
+                    request=request,
+                    related_object=transfer,
+                )
+
+                return Response(
+                    {
+                        'detail': 'Stock moved successfully.',
+                        'transfer': StockTransferSerializer(transfer).data,
+                    },
+                    status=status.HTTP_201_CREATED,
+                )
+            except Exception as e:
+                return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class AdminWarehouseToBranchExcelTransferView(APIView):
+    """
+    Admin-only endpoint to move stock from a warehouse or branch to a branch via an Excel file.
+    Upload an .xlsx file listing product names and quantities; the transfer is created
+    and completed immediately without any approval step.
+    """
+    permission_classes = [IsAuthenticated, IsAdminOrOwner]
+
+    @swagger_auto_schema(
+        request_body=AdminWarehouseToBranchExcelSerializer,
+        responses={
+            201: openapi.Response(
+                description='Stock moved via Excel successfully.',
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'created': openapi.Schema(type=openapi.TYPE_ARRAY, items=openapi.Schema(type=openapi.TYPE_OBJECT)),
+                        'errors': openapi.Schema(type=openapi.TYPE_ARRAY, items=openapi.Schema(type=openapi.TYPE_OBJECT)),
+                        'summary': openapi.Schema(
+                            type=openapi.TYPE_OBJECT,
+                            properties={
+                                'total_rows': openapi.Schema(type=openapi.TYPE_INTEGER),
+                                'successful': openapi.Schema(type=openapi.TYPE_INTEGER),
+                                'failed': openapi.Schema(type=openapi.TYPE_INTEGER),
+                            }
+                        ),
+                    }
+                )
+            ),
+            400: openapi.Response(description='Validation or stock error'),
+            403: openapi.Response(description='Admin/Owner access required'),
+        }
+    )
+    def post(self, request):
+        """
+        Move stock from a warehouse or branch to a branch via Excel upload (admin only, immediate, no approval).
+
+        Upload an .xlsx file with columns: product_name, quantity, and optionally
+        description, selling_price, reorder_level, item_notes.
+        Provide either `source_warehouse_id` or `source_branch_id`, and `destination_branch_id` as form fields.
+        The service resolves each product row to the oldest FIFO-ordered stock entry
+        in the source warehouse or branch and immediately completes the transfer.
+        """
+        serializer = AdminWarehouseToBranchExcelSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                result = services.admin_import_warehouse_to_branch_from_excel(
+                    file_obj=serializer.validated_data['file'],
+                    source_warehouse_id=serializer.validated_data.get('source_warehouse_id'),
+                    source_branch_id=serializer.validated_data.get('source_branch_id'),
+                    destination_branch_id=serializer.validated_data['destination_branch_id'],
+                    reference_number=serializer.validated_data.get('reference_number') or None,
+                    notes=serializer.validated_data.get('notes', ''),
+                    created_by=request.user,
+                )
+
+                log_activity(
+                    activity_type=ActivityType.CUSTOM,
+                    user=request.user,
+                    description=(
+                        f"Admin imported transfer from Excel: "
+                        f"{result['summary']['successful']} rows succeeded, "
+                        f"{result['summary']['failed']} failed"
+                    ),
+                    request=request,
+                )
+
+                return Response(result, status=status.HTTP_201_CREATED)
+            except ValueError as exc:
+                return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+

@@ -87,6 +87,7 @@ WSGI_APPLICATION = 'wealthbag.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+# LOCAL HOST DB
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
@@ -100,6 +101,40 @@ DATABASES = {
         },
     }
 }
+
+# DECORMASTERS DB
+
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.mysql',
+#         'NAME': 'halnmurj_decormasters',
+#         'USER': os.getenv('DB_USER', 'halnmurj_deco'),
+#         'PASSWORD': os.getenv('DB_PASSWORD', 'Deco@2026'),
+#         'HOST': os.getenv('DB_HOST', 'localhost'),
+#         'PORT': os.getenv('DB_PORT', '3306'),
+#         'OPTIONS': {
+#             'charset': 'utf8mb4',
+#         },
+#     }
+# }
+
+
+# POS DEMO DB
+
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.mysql',
+#         'NAME': 'halnmurj_pos_demo',
+#         'USER': 'halnmurj_pos_demo_user',
+#         'PASSWORD': 'Carson@08082001',
+#         'HOST': 'localhost',
+#         'PORT': '3306',
+#         'OPTIONS': {
+#             'charset': 'utf8mb4',
+#         },
+#     }
+# }
+
 
 
 # Password validation

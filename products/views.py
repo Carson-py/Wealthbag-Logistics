@@ -120,64 +120,74 @@ class ProductListView(APIView):
     
     @swagger_auto_schema(request_body=CreateProductSerializer, responses={201: ProductSerializer})
     def post(self, request):
-        """Create a new product and add to warehouse with stock entry. Uses main warehouse if initial_warehouse_id not provided."""
+        """Create a new product. If initial_quantity is provided, also adds the product to a warehouse with a stock entry. Uses main warehouse if initial_warehouse_id not provided."""
         serializer = CreateProductSerializer(data=request.data)
         if serializer.is_valid():
             data = serializer.validated_data.copy()
             initial_warehouse_id = data.pop('initial_warehouse_id', None)
-            initial_quantity = data.pop('initial_quantity')
+            initial_quantity = data.pop('initial_quantity', None)
             initial_purchase_price = data.pop('initial_purchase_price', None)
+            initial_selling_price = data.pop('initial_selling_price', None)
             supplier_id = data.pop('supplier_id', None)
             batch_number = data.pop('batch_number', None)  # Auto-generated if None
             image = data.pop('image', None)  # Extract image if provided
-            
+
             # Convert category and unit to IDs if they are instances
             if 'category' in data and data['category'] is not None:
                 if hasattr(data['category'], 'id'):
                     data['category'] = data['category'].id
                 elif not isinstance(data['category'], int):
                     data['category'] = None
-            
+
             if 'unit' in data and data['unit'] is not None:
                 if hasattr(data['unit'], 'id'):
                     data['unit'] = data['unit'].id
                 elif not isinstance(data['unit'], int):
                     data['unit'] = None
-            
-            # If no warehouse specified, use main warehouse
-            if not initial_warehouse_id:
-                try:
-                    main_warehouse = services.get_main_warehouse()
-                    initial_warehouse_id = main_warehouse.id
-                except Warehouse.DoesNotExist:
-                    return Response(
-                        {'detail': 'No main warehouse found. Please mark a warehouse as main (is_main=True) or provide initial_warehouse_id.'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-            
+
             # Create product with image if provided
             product = services.create_product(image=image, created_by=request.user, **data)
-            # Use purchase_price from product if not provided
-            purchase_price = initial_purchase_price
-            
-            services.add_product_to_main_warehouse(
-                product=product,
-                warehouse_id=initial_warehouse_id,
-                quantity=initial_quantity,
-                purchase_price=purchase_price,
-                supplier_id=supplier_id,
-                batch_number=batch_number,
-                created_by=request.user
-            )
-            
-            log_activity(
-                activity_type=ActivityType.PRODUCT_CREATED,
-                user=request.user,
-                description=f"Created product: {product.name} (SKU: {product.sku}) with {initial_quantity} units at ${purchase_price} per unit",
-                request=request,
-                related_object=product,
-            )
-            
+
+            # Only add to warehouse if an initial quantity was supplied
+            if initial_quantity is not None:
+                # If no warehouse specified, fall back to main warehouse
+                if not initial_warehouse_id:
+                    try:
+                        main_warehouse = services.get_main_warehouse()
+                        initial_warehouse_id = main_warehouse.id
+                    except Warehouse.DoesNotExist:
+                        return Response(
+                            {'detail': 'No main warehouse found. Please mark a warehouse as main (is_main=True) or provide initial_warehouse_id.'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                services.add_product_to_main_warehouse(
+                    product=product,
+                    warehouse_id=initial_warehouse_id,
+                    quantity=initial_quantity,
+                    purchase_price=initial_purchase_price,
+                    selling_price=initial_selling_price,
+                    supplier_id=supplier_id,
+                    batch_number=batch_number,
+                    created_by=request.user
+                )
+
+                log_activity(
+                    activity_type=ActivityType.PRODUCT_CREATED,
+                    user=request.user,
+                    description=f"Created product: {product.name} (SKU: {product.sku}) with {initial_quantity} units at ${initial_purchase_price} per unit",
+                    request=request,
+                    related_object=product,
+                )
+            else:
+                log_activity(
+                    activity_type=ActivityType.PRODUCT_CREATED,
+                    user=request.user,
+                    description=f"Created product: {product.name} (SKU: {product.sku}) without initial stock",
+                    request=request,
+                    related_object=product,
+                )
+
             return Response(ProductSerializer(product, context={'request': request}).data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -654,6 +664,7 @@ class ExcelProductUploadView(APIView):
     """
     Upload products from Excel file.
     Expected columns (case-insensitive):
+      - sku (optional)
       - product name
       - description
       - selling prices

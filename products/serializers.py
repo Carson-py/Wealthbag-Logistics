@@ -63,8 +63,11 @@ class ProductSerializer(serializers.ModelSerializer):
 class CreateProductSerializer(serializers.ModelSerializer):
     initial_warehouse_id = serializers.IntegerField(write_only=True, required=False, allow_null=True,
                                                    help_text='Warehouse ID for initial stock. If not provided, uses the main warehouse.')
-    initial_quantity = serializers.DecimalField(max_digits=12, decimal_places=2, write_only=True, required=True)
+    initial_quantity = serializers.DecimalField(max_digits=12, decimal_places=2, write_only=True, required=False, allow_null=True,
+                                               help_text='Initial stock quantity. If not provided, only the product is created without any stock entry.')
     initial_purchase_price = serializers.DecimalField(max_digits=12, decimal_places=2, write_only=True, required=False, 
+                                                     help_text='Purchase price for initial stock. If not provided, uses product purchase_price.')
+    initial_selling_price = serializers.DecimalField(max_digits=12, decimal_places=2, write_only=True, required=False, 
                                                      help_text='Purchase price for initial stock. If not provided, uses product purchase_price.')
     batch_number = serializers.CharField(write_only=True, required=False, allow_blank=True,
                                         help_text='Batch/Lot number for initial stock (auto-generated if not provided)')
@@ -75,7 +78,7 @@ class CreateProductSerializer(serializers.ModelSerializer):
         model = Product
         fields = [
             'sku', 'name', 'image', 'category', 'unit', 'initial_warehouse_id', 'initial_quantity',
-            'initial_purchase_price', 'batch_number', 'supplier_id'
+            'initial_purchase_price', 'initial_selling_price', 'batch_number', 'supplier_id'
         ]
 
 
