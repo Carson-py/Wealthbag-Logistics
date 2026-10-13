@@ -109,7 +109,7 @@ WSGI_APPLICATION = 'wealthbag.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'decormasters_db',
+        'NAME': 'decomasters_db',
         'USER': os.getenv('DB_USER', 'deco_user'),
         'PASSWORD': os.getenv('DB_PASSWORD', 'Deco@2026'),
         'HOST': os.getenv('DB_HOST', 'localhost'),
