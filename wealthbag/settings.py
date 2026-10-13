@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     'stock',
     'accounting',
     'layby',
+    'shared',
 
     'rest_framework',
     'corsheaders',
